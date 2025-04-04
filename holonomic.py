@@ -4,109 +4,81 @@ import time
 import signal
 import sys
 
-# Customize your motor groups here
-TURNING_NODE_IDS = [0, 2, 4]
-ROLLING_NODE_IDS = [1, 3, 5]
+# Your motor configuration
+TURNING_NODE_IDS = [0, 1, 2]
+ROLLING_NODE_IDS = [3, 4, 5]
 
-TARGET_ANGLE = 0.5    # turns for turning motors
-TARGET_VELOCITY = 1.0  # turns/s for rolling motors
-
-# CANSimple function codes
-SET_AXIS_STATE = 0x07
-HEARTBEAT = 0x01
-SET_INPUT_POS = 0x0C
-SET_INPUT_VEL = 0x0D
-GET_ENCODER_ESTIMATES = 0x09
+TARGET_ANGLE = 0.5       # turns for position control
+TARGET_VELOCITY = 1.0    # turns/sec for velocity control
 
 bus = can.interface.Bus("can0", bustype="socketcan")
 
-# Flush old messages
+def to_id(node, cmd):
+    return (node << 5) | cmd
+
+# === Safe shutdown on Ctrl+C ===
+def shutdown_all():
+    print("\n🛑 Ctrl+C detected — stopping all motors.")
+    for node in TURNING_NODE_IDS + ROLLING_NODE_IDS:
+        bus.send(can.Message(
+            arbitration_id=to_id(node, 0x07),  # Set_Axis_State
+            data=struct.pack('<I', 1),  # 1 = IDLE
+            is_extended_id=False
+        ))
+        print(f"🛑 Node {node} set to IDLE.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, lambda s, f: shutdown_all())
+
+# === Main sequence ===
+# Flush old CAN traffic
 while not (bus.recv(timeout=0) is None): pass
 
-def to_arbitration_id(node_id, func_code):
-    return (node_id << 5) | func_code
-
-def set_axis_state(node_id, state):
+# Put all nodes into CLOSED_LOOP_CONTROL
+print("🔄 Entering closed-loop control...")
+for node_id in TURNING_NODE_IDS + ROLLING_NODE_IDS:
     bus.send(can.Message(
-        arbitration_id=to_arbitration_id(node_id, SET_AXIS_STATE),
-        data=struct.pack('<I', state),
+        arbitration_id=to_id(node_id, 0x07),
+        data=struct.pack('<I', 8),  # 8 = CLOSED_LOOP_CONTROL
         is_extended_id=False
     ))
 
-def enter_closed_loop(node_id):
-    set_axis_state(node_id, 8)  # CLOSED_LOOP_CONTROL
-    timeout = time.time() + 2
-    while time.time() < timeout:
-        msg = bus.recv(timeout=0.1)
-        if msg and msg.arbitration_id == to_arbitration_id(node_id, HEARTBEAT):
-            _, state, _, _ = struct.unpack('<IBBB', msg.data[:7])
-            if state == 8:
-                print(f"✅ Node {node_id} is in CLOSED_LOOP_CONTROL")
-                return True
-    print(f"❌ Node {node_id} failed to enter closed-loop")
-    return False
+# Wait for all nodes to report CLOSED_LOOP_CONTROL
+ready_nodes = set()
+while len(ready_nodes) < len(TURNING_NODE_IDS + ROLLING_NODE_IDS):
+    msg = bus.recv()
+    if msg and (msg.arbitration_id & 0x1F) == 0x01:  # Heartbeat
+        node_id = msg.arbitration_id >> 5
+        error, state, _, _ = struct.unpack('<IBBB', msg.data[:7])
+        if state == 8 and node_id not in ready_nodes:
+            ready_nodes.add(node_id)
+            print(f"✅ Node {node_id} is in CLOSED_LOOP_CONTROL")
 
-def send_position(node_id, pos):
-    msg = can.Message(
-        arbitration_id=to_arbitration_id(node_id, SET_INPUT_POS),
-        data=struct.pack('<fhh', pos, 0, 0),  # position, vel_ff, torque_ff
+# Send position to turning motors
+print("\n🎯 Sending turning motor angles...")
+for node in TURNING_NODE_IDS:
+    bus.send(can.Message(
+        arbitration_id=to_id(node, 0x0C),  # Set_Input_Pos
+        data=struct.pack('<fhh', TARGET_ANGLE, 0, 0),
         is_extended_id=False
-    )
-    bus.send(msg)
-    print(f"🎯 Turning Node {node_id}: sent position {pos:.3f}")
+    ))
+    print(f"🎯 Turning node {node} → {TARGET_ANGLE} turns")
 
-def send_velocity(node_id, velocity):
-    msg = can.Message(
-        arbitration_id=to_arbitration_id(node_id, SET_INPUT_VEL),
-        data=struct.pack('<ff', velocity, 0.0),  # velocity, torque_ff
+# Send velocity to rolling motors
+print("\n🚀 Sending rolling motor velocities...")
+for node in ROLLING_NODE_IDS:
+    bus.send(can.Message(
+        arbitration_id=to_id(node, 0x0D),  # Set_Input_Vel
+        data=struct.pack('<ff', TARGET_VELOCITY, 0.0),
         is_extended_id=False
-    )
-    bus.send(msg)
-    print(f"🚀 Rolling Node {node_id}: sent velocity {velocity:.3f}")
+    ))
+    print(f"🚀 Rolling node {node} → {TARGET_VELOCITY} turns/s")
 
-def request_encoder(node_id):
-    request_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES)
-    response_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES | 0x10)
-    bus.send(can.Message(arbitration_id=request_id, data=[], is_extended_id=False))
-    timeout = time.time() + 0.5
-    while time.time() < timeout:
-        msg = bus.recv(timeout=0.1)
-        if msg and msg.arbitration_id == response_id:
-            pos, vel = struct.unpack('<ff', msg.data)
-            print(f"📍 Node {node_id}: Pos = {pos:.3f}, Vel = {vel:.3f}")
-            return
-    print(f"⚠️ No encoder response from node {node_id}")
-
-def shutdown_all_nodes():
-    print("\n🛑 Ctrl+C detected! Stopping all nodes...")
-    for node_id in TURNING_NODE_IDS + ROLLING_NODE_IDS:
-        set_axis_state(node_id, 1)  # IDLE
-        print(f"🛑 Node {node_id} set to IDLE.")
-    sys.exit(0)
-
-# === Ctrl+C handling ===
-signal.signal(signal.SIGINT, lambda sig, frame: shutdown_all_nodes())
-
-# === Main control loop ===
-try:
-    print("🔄 Entering closed-loop mode...")
-    for node_id in TURNING_NODE_IDS + ROLLING_NODE_IDS:
-        enter_closed_loop(node_id)
-
-    print(f"\n🎯 Sending position {TARGET_ANGLE:.3f} to turning motors...")
-    for node_id in TURNING_NODE_IDS:
-        send_position(node_id, TARGET_ANGLE)
-
-    print(f"\n🚀 Sending velocity {TARGET_VELOCITY:.3f} to rolling motors...")
-    for node_id in ROLLING_NODE_IDS:
-        send_velocity(node_id, TARGET_VELOCITY)
-
-    # Live encoder feedback loop
-    while True:
-        for node_id in TURNING_NODE_IDS + ROLLING_NODE_IDS:
-            request_encoder(node_id)
-        time.sleep(0.5)
-
-except Exception as e:
-    print(f"\n❌ Exception occurred: {e}")
-    shutdown_all_nodes()
+# Listen for encoder estimates (printed if received)
+print("\n📡 Listening for encoder feedback...")
+while True:
+    msg = bus.recv()
+    if msg and (msg.arbitration_id & 0x1F) == 0x09:  # Encoder estimates
+        node_id = msg.arbitration_id >> 5
+        pos, vel = struct.unpack('<ff', msg.data)
+        print(f"📍 Node {node_id} | Pos: {pos:.3f}, Vel: {vel:.3f}")
