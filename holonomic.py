@@ -1,163 +1,69 @@
-#!/usr/bin/env python3
-"""
-Minimal example of controlling a 3-caster (6-motor) swerve drive
-via ODrive CAN from a Raspberry Pi + CAN Hat.
+# holonomic_odrive_base.py
+# Control script for a holonomic base with 6 ODrive-controlled motors via CAN
 
-Each caster has:
- - a "turn" motor (steering) -> Node IDs: 0, 2, 4
- - a "drive" motor (rolling) -> Node IDs: 1, 3, 5
-
-IMPORTANT: This is a simple demonstration of sending velocity
-           setpoints. Adapt it to your actual gear ratios,
-           ODrive velocity units, and swerve logic.
-
-Author: [Your Name]
-Date: [Month Year]
-"""
-
-import time
-import math
 import can
+import struct
+import time
+import numpy as np
 
-##############################################################################
-#                           USER-DEFINED PARAMS                               #
-##############################################################################
+# Define constants
+CONTROL_FREQ = 250
+CONTROL_PERIOD = 1.0 / CONTROL_FREQ
+TWO_PI = 2 * np.pi
+NODE_IDS = {
+    "steer": [0, 2, 4],  # steer motors (aligned)
+    "drive": [1, 3, 5],  # drive motors
+}
 
-# --- Pi CAN interface name (often 'can0') ---
-CAN_INTERFACE = 'can0'
+# CAN IDs (ODrive native protocol)
+FUNC_SET_VELOCITY = 0x0d
+FUNC_HEARTBEAT = 0x001
 
-# --- ODrive node IDs for 3 turning axes and 3 driving axes ---
-TURN_NODE_IDS  = [0, 2, 4]  # Example
-DRIVE_NODE_IDS = [1, 3, 5]  # Example
+def make_id(function_code, node_id):
+    return (function_code << 5) | node_id
 
-# --- ODrive "set velocity" command offset ---
-# Depending on ODrive firmware, this might be 0x00 or 0x07, etc.
-ODRIVE_VEL_CMD_OFFSET = 0x00
+class ODriveMotor:
+    def __init__(self, bus, node_id):
+        self.bus = bus
+        self.node_id = node_id
 
-# --- Maximum velocity commands (in encoder counts/s) to limit outputs ---
-TURN_SPEED_MAX  = 30000  # example limit
-DRIVE_SPEED_MAX = 50000  # example limit
+    def set_velocity(self, velocity_rps):
+        msg_id = make_id(FUNC_SET_VELOCITY, self.node_id)
+        data = struct.pack('<f', velocity_rps) + b'\x00\x00\x00\x00'
+        msg = can.Message(arbitration_id=msg_id, data=data, is_extended_id=False)
+        self.bus.send(msg)
 
-# --- Robot geometry for 3-caster swerve (example) ---
-L = 0.25    # radius from center to each caster (m)
-WHEEL_R = 0.05  # wheel radius (m)
+class HolonomicBase:
+    def __init__(self, can_bus):
+        self.bus = can_bus
+        self.steer_motors = [ODriveMotor(self.bus, nid) for nid in NODE_IDS["steer"]]
+        self.drive_motors = [ODriveMotor(self.bus, nid) for nid in NODE_IDS["drive"]]
 
-##############################################################################
-#                          INVERSE KINEMATICS                                 #
-##############################################################################
+    def align_steer_motors(self, angle_rad):
+        velocity_rps = 0.0  # hold position (we're using velocity control for now)
+        for motor in self.steer_motors:
+            motor.set_velocity(velocity_rps)
 
-def swerve_ik(vx, vy, omega):
-    """
-    Basic 3-wheel swerve inverse kinematics.
+    def drive(self, vx, vy, omega):
+        # Simple placeholder logic - forward motion only for example
+        # Later: use proper inverse kinematics
+        for motor in self.drive_motors:
+            motor.set_velocity(vx * 10)  # scale to RPS
 
-    Inputs:
-      vx    : robot velocity in X (m/s)
-      vy    : robot velocity in Y (m/s)
-      omega : robot angular velocity about Z (rad/s)
+    def stop(self):
+        for motor in self.steer_motors + self.drive_motors:
+            motor.set_velocity(0.0)
 
-    Returns:
-      turn_cmds  : list of steering motor speeds (counts/s) (length=3)
-      drive_cmds : list of drive motor speeds (counts/s) (length=3)
-    """
-    # Three modules spaced 120 deg apart
-    angles = [0, 2*math.pi/3, 4*math.pi/3]
-
-    turn_cmds  = []
-    drive_cmds = []
-
-    for ang in angles:
-        # In real swerve, you typically do position control for the steering axis.
-        # For demonstration, let's say we send a velocity command based on omega:
-        steer_speed = omega * 3000.0  # TOTALLY arbitrary scale for demonstration
-        # Limit to max safe value
-        steer_speed = max(-TURN_SPEED_MAX, min(TURN_SPEED_MAX, steer_speed))
-
-        # For the drive speed, let's do a naive approach:
-        # - Project [vx, vy] onto direction of the wheel
-        # - Add tangential speed from rotation about the center
-        wheel_dir_x = math.cos(ang)
-        wheel_dir_y = math.sin(ang)
-
-        linear_part = vx * wheel_dir_x + vy * wheel_dir_y
-        # For rotation: tangential speed = omega * radius (assuming the wheel is oriented tangentially)
-        # This is simplified! Real swerve logic is more nuanced (you find the actual orientation).
-        # We'll just add or subtract something for demonstration.
-        # e.g. tangential = omega * L (some sign depending on angle)
-        tangential = omega * L  # simplistic
-
-        wheel_speed_m_s = linear_part + tangential
-
-        # Convert m/s to ODrive motor speed in "counts/s"
-        # (You must incorporate gear ratio and encoder CPR).
-        # For demonstration, let's do a big scale factor:
-        drive_cmd = wheel_speed_m_s * 10000.0
-        drive_cmd = max(-DRIVE_SPEED_MAX, min(DRIVE_SPEED_MAX, drive_cmd))
-
-        turn_cmds.append(steer_speed)
-        drive_cmds.append(drive_cmd)
-
-    return turn_cmds, drive_cmds
-
-##############################################################################
-#                           ODRIVE CAN HELPER                                 #
-##############################################################################
-
-class ODriveCAN:
-    """
-    Minimal helper class to send velocity commands to ODrive via CAN.
-    """
-
-    def __init__(self, interface):
-        # python-can uses "socketcan" interface on Linux (Raspberry Pi).
-        # Make sure 'can0' is up with the correct bitrate before running.
-        self.bus = can.interface.Bus(channel=interface, bustype='socketcan')
-
-    def send_velocity_command(self, node_id, vel_counts_s, torque_ff=0):
-        """
-        Send velocity setpoint to ODrive axis (Node ID = node_id).
-        The ODrive expects data in certain formats; check your firmware doc.
-
-        Typically, velocity is a 32-bit int (counts/s * 0.001?), feed-forward torque is 32-bit int.
-        The code below is an example. Adjust scale as needed for your ODrive version.
-        """
-        # Example: many ODrive firmwares interpret the velocity as an int32 in 0.001 counts/s.
-        vel_int = int(vel_counts_s * 0.001)  
-        trq_int = int(torque_ff * 1000)
-
-        arb_id = (node_id << 5) + ODRIVE_VEL_CMD_OFFSET
-        data   = vel_int.to_bytes(4, byteorder='little', signed=True) + \
-                 trq_int.to_bytes(4, byteorder='little', signed=True)
-
-        msg = can.Message(arbitration_id=arb_id, data=data, is_extended_id=False)
-        try:
-            self.bus.send(msg)
-        except can.CanError:
-            print(f"Failed to send velocity cmd to node {node_id}")
-
-##############################################################################
-#                              MAIN LOOP                                     #
-##############################################################################
-
-if __name__ == "__main__":
-    odrive_can = ODriveCAN(CAN_INTERFACE)
-
-    # Example desired motion: move forward at 0.2 m/s, no lateral, small rotation
-    vx_des = 0.2
-    vy_des = 0.0
-    w_des  = 0.3  # rad/s
+if __name__ == '__main__':
+    bus = can.interface.Bus(channel='can0', bustype='socketcan')
+    base = HolonomicBase(bus)
 
     try:
-        while True:
-            # Compute swerve velocities
-            turn_cmds, drive_cmds = swerve_ik(vx_des, vy_des, w_des)
-
-            # Send to each of the 3 caster modules
-            for i in range(3):
-                odrive_can.send_velocity_command(TURN_NODE_IDS[i],  turn_cmds[i])
-                odrive_can.send_velocity_command(DRIVE_NODE_IDS[i], drive_cmds[i])
-
-            # 50 Hz loop
-            time.sleep(0.02)
-
-    except KeyboardInterrupt:
-        print("Stopping by user request.")
+        print("Starting holonomic base control loop...")
+        for _ in range(250):  # Run for 1 second
+            base.align_steer_motors(0.0)
+            base.drive(0.2, 0.0, 0.0)  # move forward
+            time.sleep(CONTROL_PERIOD)
+    finally:
+        base.stop()
+        print("Stopped holonomic base")
