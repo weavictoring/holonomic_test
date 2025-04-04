@@ -1,69 +1,78 @@
-# holonomic_odrive_base.py
-# Control script for a holonomic base with 6 ODrive-controlled motors via CAN
-
 import can
 import struct
 import time
-import numpy as np
 
-# Define constants
-CONTROL_FREQ = 250
-CONTROL_PERIOD = 1.0 / CONTROL_FREQ
-TWO_PI = 2 * np.pi
-NODE_IDS = {
-    "steer": [0, 2, 4],  # steer motors (aligned)
-    "drive": [1, 3, 5],  # drive motors
-}
+NODE_IDS = list(range(6))  # Node IDs 0–5
+VEL_SETPOINT = 1.0  # turns/s
 
-# CAN IDs (ODrive native protocol)
-FUNC_SET_VELOCITY = 0x0d
-FUNC_HEARTBEAT = 0x001
+# CAN function codes
+SET_AXIS_STATE = 0x07
+HEARTBEAT = 0x01
+SET_INPUT_VEL = 0x0D
+GET_ENCODER_ESTIMATES = 0x09
 
-def make_id(function_code, node_id):
-    return (function_code << 5) | node_id
+bus = can.interface.Bus("can0", bustype="socketcan")
 
-class ODriveMotor:
-    def __init__(self, bus, node_id):
-        self.bus = bus
-        self.node_id = node_id
+# Flush any old CAN messages
+while not (bus.recv(timeout=0) is None): pass
 
-    def set_velocity(self, velocity_rps):
-        msg_id = make_id(FUNC_SET_VELOCITY, self.node_id)
-        data = struct.pack('<f', velocity_rps) + b'\x00\x00\x00\x00'
-        msg = can.Message(arbitration_id=msg_id, data=data, is_extended_id=False)
-        self.bus.send(msg)
+def to_arbitration_id(node_id, func_code):
+    return (node_id << 5) | func_code
 
-class HolonomicBase:
-    def __init__(self, can_bus):
-        self.bus = can_bus
-        self.steer_motors = [ODriveMotor(self.bus, nid) for nid in NODE_IDS["steer"]]
-        self.drive_motors = [ODriveMotor(self.bus, nid) for nid in NODE_IDS["drive"]]
+def enter_closed_loop(node_id):
+    print(f"🔄 Setting node {node_id} to CLOSED_LOOP_CONTROL...")
+    bus.send(can.Message(
+        arbitration_id=to_arbitration_id(node_id, SET_AXIS_STATE),
+        data=struct.pack('<I', 8),  # 8 = CLOSED_LOOP_CONTROL
+        is_extended_id=False
+    ))
 
-    def align_steer_motors(self, angle_rad):
-        velocity_rps = 0.0  # hold position (we're using velocity control for now)
-        for motor in self.steer_motors:
-            motor.set_velocity(velocity_rps)
+    # Wait for heartbeat with state 8
+    timeout = time.time() + 2
+    while time.time() < timeout:
+        msg = bus.recv(timeout=0.1)
+        if msg and msg.arbitration_id == to_arbitration_id(node_id, HEARTBEAT):
+            _, state, _, _ = struct.unpack('<IBBB', msg.data[:7])
+            if state == 8:
+                print(f"✅ Node {node_id} is now in CLOSED_LOOP_CONTROL.")
+                return True
+    print(f"❌ Timeout waiting for node {node_id} to enter closed-loop.")
+    return False
 
-    def drive(self, vx, vy, omega):
-        # Simple placeholder logic - forward motion only for example
-        # Later: use proper inverse kinematics
-        for motor in self.drive_motors:
-            motor.set_velocity(vx * 10)  # scale to RPS
+def send_velocity(node_id, velocity):
+    print(f"🚀 Sending velocity {velocity:.2f} turns/s to node {node_id}")
+    bus.send(can.Message(
+        arbitration_id=to_arbitration_id(node_id, SET_INPUT_VEL),
+        data=struct.pack('<ff', velocity, 0.0),  # velocity, torque_ff
+        is_extended_id=False
+    ))
 
-    def stop(self):
-        for motor in self.steer_motors + self.drive_motors:
-            motor.set_velocity(0.0)
+def request_encoder_estimate(node_id):
+    request_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES)
+    response_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES | 0x10)
 
-if __name__ == '__main__':
-    bus = can.interface.Bus(channel='can0', bustype='socketcan')
-    base = HolonomicBase(bus)
+    bus.send(can.Message(
+        arbitration_id=request_id,
+        data=[],
+        is_extended_id=False
+    ))
 
-    try:
-        print("Starting holonomic base control loop...")
-        for _ in range(250):  # Run for 1 second
-            base.align_steer_motors(0.0)
-            base.drive(0.2, 0.0, 0.0)  # move forward
-            time.sleep(CONTROL_PERIOD)
-    finally:
-        base.stop()
-        print("Stopped holonomic base")
+    timeout = time.time() + 0.5
+    while time.time() < timeout:
+        msg = bus.recv(timeout=0.1)
+        if msg and msg.arbitration_id == response_id:
+            pos, vel = struct.unpack('<ff', msg.data)
+            print(f"📍 Node {node_id}: Pos = {pos:.3f} turns, Vel = {vel:.3f} turns/s")
+            return
+    print(f"⚠️ No encoder response from node {node_id}")
+
+# === Main Control Loop ===
+print("🚦 Starting multi-node ODrive CAN test...")
+
+for node_id in NODE_IDS:
+    if enter_closed_loop(node_id):
+        send_velocity(node_id, VEL_SETPOINT)
+        time.sleep(0.1)
+        request_encoder_estimate(node_id)
+    else:
+        print(f"⚠️ Skipping velocity command to node {node_id} due to state failure.")
