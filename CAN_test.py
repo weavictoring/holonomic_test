@@ -2,86 +2,54 @@ import can
 import struct
 import time
 
-# ODrive CAN protocol uses 11-bit IDs
-# Sample node ID. Change if your ODrive uses a different one.
-NODE_ID = 0x01
+# IDs from 0 to 5
+NODE_IDS = list(range(6))
+BITRATE = 250000
 
-# Standard CAN IDs for reading ODrive data (requesting)
-ODRIVE_CAN_IDS = {
-    "heartbeat": 0x001,
-    "get_encoder_estimates": 0x009,
-    "get_iq": 0x00A,
-    "get_bus_voltage_current": 0x017,
-    "get_error": 0x003,
-}
+# Function codes from ODrive CAN protocol
+FUNC_ENCODER_ESTIMATES = 0x09
+FUNC_IQ = 0x0A
+FUNC_BUS_VOLTAGE_CURRENT = 0x17
+FUNC_ERROR = 0x03
 
-# Request IDs are formed by: 0x00 + function_id << 5 + node_id
-def get_request_id(function_code, node_id=NODE_ID):
-    return (function_code << 5) | node_id
+# Request/response ID helpers
+def req_id(func, node_id): return (func << 5) | node_id
+def resp_id(func, node_id): return ((func | 0x10) << 5) | node_id
 
-# Setup CAN bus
+# CAN bus init (make sure can0 is up separately before running this)
 bus = can.interface.Bus(channel='can0', bustype='socketcan')
 
-# Function to send a CAN request and wait for the response
-def send_request_and_receive(request_id, response_id, timeout=0.5):
-    msg = can.Message(arbitration_id=request_id, data=[], is_extended_id=False)
+# Function to send a request and wait for response
+def send_request(node_id, func_code):
+    rid = req_id(func_code, node_id)
+    resp = resp_id(func_code, node_id)
+
+    msg = can.Message(arbitration_id=rid, data=[], is_extended_id=False)
     try:
         bus.send(msg)
-        print(f"Sent request with ID: 0x{request_id:03X}")
     except can.CanError as e:
-        print(f"CAN send error: {e}")
+        print(f"CAN send error to node {node_id}: {e}")
         return None
 
-    # Wait for response
     start = time.time()
-    while time.time() - start < timeout:
-        response = bus.recv(timeout)
-        if response and response.arbitration_id == response_id:
-            return response.data
-    print(f"Timeout waiting for response to 0x{response_id:03X}")
+    while time.time() - start < 0.5:
+        rx = bus.recv(timeout=0.1)
+        if rx and rx.arbitration_id == resp:
+            return rx.data
     return None
 
-# Decode and print various ODrive info
-def read_encoder_estimates():
-    request_id = get_request_id(0x09)
-    response_id = get_request_id(0x09 | 0x10)  # response bit set
+# Function to scan nodes and print encoder position/velocity
+def scan_odrives():
+    for node_id in NODE_IDS:
+        print(f"\n🧭 Scanning node {node_id}...")
 
-    data = send_request_and_receive(request_id, response_id)
-    if data:
-        pos, vel = struct.unpack('<ff', data)
-        print(f"Encoder Position: {pos:.3f} turns, Velocity: {vel:.3f} turns/s")
+        data = send_request(node_id, FUNC_ENCODER_ESTIMATES)
+        if data:
+            pos, vel = struct.unpack('<ff', data)
+            print(f"✅ Node {node_id} OK | Pos: {pos:.2f}, Vel: {vel:.2f}")
+        else:
+            print(f"⚠️ No response from node {node_id}")
 
-def read_iq():
-    request_id = get_request_id(0x0A)
-    response_id = get_request_id(0x0A | 0x10)
-
-    data = send_request_and_receive(request_id, response_id)
-    if data:
-        iq_setpoint, iq_measured = struct.unpack('<ff', data)
-        print(f"Iq Setpoint: {iq_setpoint:.3f} A, Iq Measured: {iq_measured:.3f} A")
-
-def read_bus_voltage_current():
-    request_id = get_request_id(0x17)
-    response_id = get_request_id(0x17 | 0x10)
-
-    data = send_request_and_receive(request_id, response_id)
-    if data:
-        voltage, current = struct.unpack('<ff', data)
-        print(f"Bus Voltage: {voltage:.2f} V, Bus Current: {current:.2f} A")
-
-def read_error():
-    request_id = get_request_id(0x03)
-    response_id = get_request_id(0x03 | 0x10)
-
-    data = send_request_and_receive(request_id, response_id)
-    if data:
-        axis_error = struct.unpack('<I', data[:4])[0]
-        print(f"Axis Error: 0x{axis_error:08X}")
-
-# === MAIN ===
 if __name__ == "__main__":
-    print("Reading ODrive data via CAN...\n")
-    read_encoder_estimates()
-    read_iq()
-    read_bus_voltage_current()
-    read_error()
+    print("🚦 Scanning ODrive nodes on CAN bus (can0)...\n")
+    scan_odrives()
