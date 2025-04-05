@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 
 """
-Calibrates direction + offset for each motor in a step-by-step manner.
+Calibrates flips + offsets for all motors (turning + rolling) while
+ALL motors remain in CLOSED_LOOP_CONTROL.
 
-For each motor (turning or rolling):
-1) Clear errors
-2) Enter CLOSED_LOOP_CONTROL
-3) Send a small positive velocity for a few seconds
-   - Continuously request encoder data, printing "pos=xxx" so you see if it increases or decreases
-   - Observe physically which way it's turning
-4) Ask if that is the correct forward direction (y/n). If no => flip=-1, else flip=+1
-5) For turning motors, prompt user to align motor at mechanical zero, read encoder once => offset
-6) Return motor to IDLE
-7) Save to JSON { node_id: { "flip": ±1.0, "offset": ... }, ... }
+Steps:
+1) Clear errors on all nodes.
+2) Put all nodes in CLOSED_LOOP_CONTROL.
+3) For each motor in turn:
+   a) Set velocity=TEST_VELOCITY on that motor, set velocity=0 on others.
+   b) Repeatedly request encoder from that motor and print positions
+      so you can confirm if physically it's rotating forward or backward.
+   c) Prompt user: flip direction or not.
+   d) If turning motor, prompt user to align to mechanical zero, read encoder once => offset.
+4) After all motors are done, set them all to IDLE.
+5) Save config (flip + offset for each node) to motor_config.json
 
-At the end, you have a config file you can load in your main script to apply flips + offsets.
+Use 'flip' and 'offset' in your control script as:
+  turning_final_angle = offset + flip * desired_angle
+  rolling_final_velocity = flip * desired_velocity
 """
 
 import can
 import struct
-import json
 import time
+import json
 import sys
-import select
 
 TURNING_NODE_IDS = [0, 2, 4]
 ROLLING_NODE_IDS = [1, 3, 5]
@@ -41,51 +44,50 @@ HEARTBEAT = 0x01
 CLOSED_LOOP = 8
 IDLE = 1
 
-# We'll apply a small velocity to test direction
-TEST_VELOCITY = 0.1  # turns/s (adjust if too fast or too slow)
-TEST_DURATION = 3.0  # seconds to run the direction test
+# Velocity test params
+TEST_VELOCITY = 0.2   # turns/s
+TEST_DURATION = 5.0   # seconds to run test for each motor
 
 bus = can.interface.Bus("can0", bustype="socketcan")
 
-def to_arbitration_id(node_id, func_code):
-    """Helper to build arbitration ID for ODrive CANSimple."""
+def to_id(node_id, func_code):
+    """Build ODrive CANSimple arbitration ID."""
     return (node_id << 5) | func_code
 
-def send_set_axis_state(node_id, state):
-    """Sends Set_Axis_State command."""
-    msg = can.Message(
-        arbitration_id=to_arbitration_id(node_id, SET_AXIS_STATE),
-        data=struct.pack('<I', state),
-        is_extended_id=False
-    )
-    bus.send(msg)
-
-def send_clear_errors(node_id):
+def clear_errors(node_id):
     """Sends Clear_Errors command."""
-    msg = can.Message(
-        arbitration_id=to_arbitration_id(node_id, CLEAR_ERRORS),
+    bus.send(can.Message(
+        arbitration_id=to_id(node_id, CLEAR_ERRORS),
         data=[],
         is_extended_id=False
+    ))
+
+def set_axis_state(node_id, state_int):
+    """Sends Set_Axis_State command."""
+    msg = can.Message(
+        arbitration_id=to_id(node_id, SET_AXIS_STATE),
+        data=struct.pack('<I', state_int),
+        is_extended_id=False
     )
     bus.send(msg)
 
-def send_input_vel(node_id, vel, torque_ff=0.0):
+def set_input_vel(node_id, velocity, torque_ff=0.0):
     """Sends Set_Input_Vel command."""
     msg = can.Message(
-        arbitration_id=to_arbitration_id(node_id, SET_INPUT_VEL),
-        data=struct.pack('<ff', vel, torque_ff),
+        arbitration_id=to_id(node_id, SET_INPUT_VEL),
+        data=struct.pack('<ff', velocity, torque_ff),
         is_extended_id=False
     )
     bus.send(msg)
 
 def request_encoder_once(node_id, timeout=0.3):
     """
-    Sends one Get_Encoder_Estimates (0x09) request to 'node_id'.
-    Waits up to 'timeout' seconds for the reply (node<<5 | (0x09|0x10)).
-    Returns (pos, vel) or None if no response.
+    Sends one Get_Encoder_Estimates (0x09) request.
+    Waits up to `timeout` for response (arbitration_id = node<<5 | 0x19).
+    Returns (pos, vel) or None if no reply.
     """
-    req_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES)
-    resp_id = to_arbitration_id(node_id, GET_ENCODER_ESTIMATES | 0x10)
+    req_id = to_id(node_id, GET_ENCODER_ESTIMATES)
+    resp_id = to_id(node_id, GET_ENCODER_ESTIMATES | 0x10)
 
     bus.send(can.Message(arbitration_id=req_id, data=[], is_extended_id=False))
 
@@ -98,126 +100,131 @@ def request_encoder_once(node_id, timeout=0.3):
     return None
 
 def wait_for_closed_loop(node_id, timeout=2.0):
-    """
-    Wait until the motor reports AxisState=CLOSED_LOOP_CONTROL in heartbeat.
-    Returns True if successful, False if timed out.
-    """
+    """Wait until heartbeat shows AxisState=8 (CLOSED_LOOP)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         msg = bus.recv(timeout=0.2)
         if msg and (msg.arbitration_id & 0x1F) == HEARTBEAT:
             n_id = msg.arbitration_id >> 5
             if n_id == node_id:
-                axis_error, axis_state, _, _ = struct.unpack('<IBBB', msg.data[:7])
-                if axis_state == CLOSED_LOOP:
+                error, state, _, _ = struct.unpack('<IBBB', msg.data[:7])
+                if state == CLOSED_LOOP:
                     return True
     return False
 
-def direction_test(node_id):
-    """
-    1) Apply small positive velocity for TEST_DURATION seconds
-    2) Repeatedly request encoder and print pos changes
-    3) Ask user if it's correct forward direction => returns +1 or -1
-    """
-    print(f"   → Setting velocity={TEST_VELOCITY} for ~{TEST_DURATION} seconds...")
-    send_input_vel(node_id, TEST_VELOCITY)
-
-    t0 = time.time()
-    prev_pos = None
-    while (time.time() - t0) < TEST_DURATION:
-        res = request_encoder_once(node_id)
-        if res is not None:
-            pos, vel = res
-            if prev_pos is not None:
-                diff = pos - prev_pos
-                print(f"   Node {node_id} pos={pos:.3f} (delta={diff:.3f})")
-            else:
-                print(f"   Node {node_id} pos={pos:.3f}")
-            prev_pos = pos
-        else:
-            print("   No encoder response (check if firmware supports requests in this state).")
-
-        # Sleep a bit
-        time.sleep(0.4)
-
-    # Stop movement
-    send_input_vel(node_id, 0.0)
-    # Ask if direction is correct
-    ans = input(f"\n   Did motor {node_id} rotate FORWARD physically? (y/n) [y]: ")
-    if ans.strip().lower().startswith("n"):
-        flip = -1.0
-        print("   → We'll flip direction for this motor.")
-    else:
-        flip = 1.0
-        print("   → No flip needed.")
-    return flip
-
-def calibrate_turning_offset(node_id, flip_sign):
-    """
-    Prompt user to physically align turning motor at zero,
-    read encoder once => offset = that raw position.
-    We'll store that raw offset in the config. Then in your control script you do:
-       final_angle = offset + flip*(desired_angle)
-    """
-    input(f"\n   Align TURNING motor {node_id} to your mechanical ZERO, then press ENTER...")
-
-    res = request_encoder_once(node_id)
-    if res is None:
-        print("   ⚠️ No encoder response => offset=0.0")
-        return 0.0
-    pos, _ = res
-    print(f"   Node {node_id} raw offset = {pos:.3f}")
-    return pos
-
 def main():
-    # Clear old messages
+    print("=== BEGIN CALIBRATION (All nodes in same state) ===")
+
+    # 1) Clear old messages from bus
     while not (bus.recv(timeout=0) is None):
         pass
 
-    config_data = {}
-
-    for node_id in ALL_NODE_IDS:
-        print(f"\n=== Calibrating motor {node_id} ===")
-        # 1) Clear errors
-        send_clear_errors(node_id)
+    # 2) Clear errors for all nodes
+    print("🧹 Clearing errors on all nodes...")
+    for node in ALL_NODE_IDS:
+        clear_errors(node)
         time.sleep(0.05)
 
-        # 2) Enter CLOSED_LOOP_CONTROL
-        send_set_axis_state(node_id, CLOSED_LOOP)
-        print(f"   Waiting for node {node_id} to go CLOSED_LOOP...")
-        if wait_for_closed_loop(node_id, 3.0):
-            print(f"   ✅ Node {node_id} is CLOSED_LOOP.")
+    # 3) Put ALL nodes into CLOSED_LOOP_CONTROL
+    print("🔄 Putting all nodes in CLOSED_LOOP_CONTROL...")
+    for node in ALL_NODE_IDS:
+        set_axis_state(node, CLOSED_LOOP)
+
+    # 4) Wait for them all to confirm
+    not_ready = set(ALL_NODE_IDS)
+    deadline = time.time() + 3
+    while time.time() < deadline and not_ready:
+        msg = bus.recv(timeout=0.2)
+        if msg and (msg.arbitration_id & 0x1F) == HEARTBEAT:
+            n_id = msg.arbitration_id >> 5
+            if n_id in not_ready:
+                _, state, _, _ = struct.unpack('<IBBB', msg.data[:7])
+                if state == CLOSED_LOOP:
+                    not_ready.remove(n_id)
+                    print(f"✅ Node {n_id} in CLOSED_LOOP_CONTROL")
+    if not_ready:
+        print(f"⚠️ The following nodes never confirmed CLOSED_LOOP: {not_ready}")
+
+    # 5) Zero velocities initially
+    print("\n⚙️ Setting velocity=0 on all nodes so none move initially.")
+    for node in ALL_NODE_IDS:
+        set_input_vel(node, 0.0)
+
+    # 6) For each node: direction test + offset
+    config_data = {}
+    for node in ALL_NODE_IDS:
+        print(f"\n=== Node {node} direction test ===")
+
+        # a) Set test velocity on this node, 0 on others
+        print(f"   Setting node {node} velocity={TEST_VELOCITY}, others=0")
+        for n2 in ALL_NODE_IDS:
+            if n2 == node:
+                set_input_vel(n2, TEST_VELOCITY)
+            else:
+                set_input_vel(n2, 0.0)
+
+        # b) Keep requesting encoder from this node for ~TEST_DURATION
+        t0 = time.time()
+        prev_pos = None
+        while time.time() - t0 < TEST_DURATION:
+            res = request_encoder_once(node)
+            if res is not None:
+                pos, vel = res
+                if prev_pos is not None:
+                    dpos = pos - prev_pos
+                    print(f"   Node {node}: pos={pos:.3f}, (delta={dpos:.3f})")
+                else:
+                    print(f"   Node {node}: pos={pos:.3f}")
+                prev_pos = pos
+            else:
+                print("   No encoder response, continuing...")
+
+            time.sleep(0.4)
+
+        # Stop movement for this node
+        set_input_vel(node, 0.0)
+
+        # c) Ask user if direction is correct
+        ans = input(f"\n   Did node {node} rotate forward physically? (y/n) [y]: ")
+        if ans.strip().lower().startswith('n'):
+            flip = -1.0
+            print("   → We'll flip direction for this motor.")
         else:
-            print(f"   ⚠️ Node {node_id} did NOT enter CLOSED_LOOP. Continuing anyway...")
+            flip = 1.0
+            print("   → No flip needed.")
 
-        # 3) Direction test: spin slowly, read position
-        flip_sign = direction_test(node_id)
-
-        # 4) If turning motor, prompt user to align zero => record offset
-        if node_id in TURNING_NODE_IDS:
-            offset_val = calibrate_turning_offset(node_id, flip_sign)
+        # d) If turning motor, prompt user to align zero => read offset
+        if node in TURNING_NODE_IDS:
+            input(f"\n   Align TURNING motor {node} to mechanical ZERO, press ENTER to record offset...")
+            res = request_encoder_once(node)
+            if res:
+                off, _ = res
+                print(f"   Node {node} raw offset = {off:.3f}")
+            else:
+                off = 0.0
+                print("   ⚠️ No encoder response => offset=0.0 by default.")
         else:
-            offset_val = 0.0
+            off = 0.0  # rolling motors need no offset
 
-        # 5) Return to IDLE
-        send_set_axis_state(node_id, IDLE)
-        print(f"   Node {node_id} set to IDLE.\n")
-
-        config_data[node_id] = {
-            "flip": flip_sign,
-            "offset": offset_val
+        config_data[node] = {
+            "flip": flip,
+            "offset": off
         }
 
-    # Save to JSON
+    # 7) Finally, set all nodes to IDLE
+    print("\n🛑 Setting all nodes to IDLE (unpowered).")
+    for node in ALL_NODE_IDS:
+        set_axis_state(node, IDLE)
+    print("   Done.")
+
+    # 8) Save config
     with open(CONFIG_FILE, "w") as f:
         json.dump(config_data, f, indent=2)
+    print(f"\n💾 Saved calibration to '{CONFIG_FILE}'.\n")
+    print("Use them in your control script, e.g.:")
+    print("  turning_final_angle = offset + flip * desired_angle")
+    print("  rolling_final_vel   = flip * desired_vel\n")
 
-    print(f"\n✅ Done calibrating all motors. Saved to '{CONFIG_FILE}'.\n")
-    print("Use 'flip' and 'offset' in your main script as needed, e.g.:")
-    print("  final_angle   = offset + flip*(desired_angle)    (for turning)")
-    print("  final_vel     = flip*(desired_velocity)          (for rolling)\n")
 
 if __name__ == "__main__":
-    # For reading console input in the direction_test loop (non-blocking),
-    # we need 'select' on some systems. We'll just ensure it’s imported:
     main()
