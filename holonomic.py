@@ -34,8 +34,10 @@ ALL_NODE_IDS = TURNING_NODE_IDS + ROLLING_NODE_IDS
 MOTOR_CONFIG_FILE = "motor_config.json"
 
 # Desired motion
-TARGET_ANGLE = 0.5       # turns for turning motors
+TARGET_ANGLE = 0       # turns for turning motors
 TARGET_VELOCITY = 1.0    # turns/s for rolling motors
+VELOCITY_LIMIT_ROLLING = 3  # turns/s
+CURRENT_LIMIT_ROLLING = 5.0    # 5 A
 
 # CANSimple function codes
 CLEAR_ERRORS = 0x08
@@ -67,6 +69,21 @@ def shutdown_all():
 
 signal.signal(signal.SIGINT, lambda s, f: shutdown_all())
 
+def set_limits(node_id, velocity_limit, current_limit):
+    """
+    Sends the Set_Limits (0x11) command:
+      - velocity_limit (float)
+      - current_limit (float)
+    to the given ODrive node ID via CAN.
+    """
+    FUNC_SET_LIMITS = 0x11
+    arbid = (node_id << 5) | FUNC_SET_LIMITS
+
+    data = struct.pack('<ff', velocity_limit, current_limit)
+    msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
+    bus.send(msg)
+    print(f"Node {node_id}: Set_Limits => vel_limit={velocity_limit}, current_limit={current_limit}")
+
 def main():
     # 1) Load motor flips + offsets from JSON
     if not os.path.exists(MOTOR_CONFIG_FILE):
@@ -95,6 +112,10 @@ def main():
             is_extended_id=False
         ))
         time.sleep(0.05)
+
+    # Set current limits for rolling joints 
+    for node_id in ROLLING_NODE_IDS:
+        set_limits(node_id, VELOCITY_LIMIT_ROLLING, CURRENT_LIMIT_ROLLING)
 
     # 4) Put all nodes in CLOSED_LOOP_CONTROL
     print("🔄 Setting all nodes to CLOSED_LOOP_CONTROL...")
