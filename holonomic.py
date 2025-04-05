@@ -10,7 +10,7 @@ TURNING_NODE_IDS = [0, 2, 4]
 ROLLING_NODE_IDS = [1, 3, 5]
 OFFSET_FILE = "turning_offsets.json"
 
-TARGET_ANGLE = 0.5       # turns
+TARGET_ANGLE = 0      # turns
 TARGET_VELOCITY = 1.0    # turns/s
 
 # CANSimple command codes
