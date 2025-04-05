@@ -5,8 +5,8 @@ import signal
 import sys
 
 # Your motor configuration
-TURNING_NODE_IDS = [0, 1, 2]
-ROLLING_NODE_IDS = [3, 4, 5]
+TURNING_NODE_IDS = [0, 2, 4]
+ROLLING_NODE_IDS = [1, 3, 5]
 
 TARGET_ANGLE = 0.5       # turns for position control
 TARGET_VELOCITY = 1.0    # turns/sec for velocity control
