@@ -13,7 +13,7 @@ This script:
      a velocity command based on the error between the desired and current angle,
      and rolling motors with:   offset + flip * desiredVelocity (in turns/s).
   7) Runs a control loop at ~50 Hz.
-  8) Logs real-time output and errors.
+  8) Logs real-time output and errors, including a live status update of commands and positions.
 
 Joystick input is read via the evdev library.
 Test carefully at low current & speed with the robot wheels off the ground!
@@ -169,6 +169,8 @@ class SwerveModule:
     def __init__(self, turn_motor, roll_motor):
         self.turn_motor = turn_motor
         self.roll_motor = roll_motor
+        # Store the last command sent for logging
+        self.last_command = (0.0, 0.0)
 
     def clear_errors(self):
         self.turn_motor.clear_errors()
@@ -186,6 +188,8 @@ class SwerveModule:
         self.roll_motor.set_limits(vel_limit, curr_limit)
 
     def command(self, turn_vel_command, roll_vel_in_turns_s):
+        # Store the command for live status logging
+        self.last_command = (turn_vel_command, roll_vel_in_turns_s)
         # Command turning motor in velocity mode using the computed velocity command.
         self.turn_motor.command_velocity(turn_vel_command)
         self.roll_motor.command_velocity(roll_vel_in_turns_s)
@@ -244,6 +248,8 @@ class SwerveVehicle:
         self.cmd_queue = queue.Queue(maxsize=1)
         self.run_flag = True
         self.ctrl_thread = threading.Thread(target=self.control_loop, daemon=True)
+        # Start a new thread for live status logging.
+        self.status_thread = threading.Thread(target=self.log_status, daemon=True)
         self.robot_size = robot_size
         self.num_wheels = num_wheels
         self.caster_offset = caster_offset
@@ -254,10 +260,12 @@ class SwerveVehicle:
 
     def start(self):
         self.ctrl_thread.start()
+        self.status_thread.start()
 
     def stop(self):
         self.run_flag = False
         self.ctrl_thread.join()
+        self.status_thread.join()
         self.feedback.stop()
         for m in self.modules:
             m.set_idle()
@@ -318,7 +326,20 @@ class SwerveVehicle:
                 mod.command(turn_vel_command, speed)
                 logging.debug(f"Module {i}: desired angle={desired_angle_turns:.3f} turns, error={error:.3f}, "
                               f"turn_vel_command={turn_vel_command:.3f} turns/s, roll speed={speed:.3f} turns/s")
-    
+
+    def log_status(self):
+        """Live log of last commands and motor positions every 1 second."""
+        while self.run_flag:
+            time.sleep(1.0)
+            for i, mod in enumerate(self.modules):
+                # Retrieve last commanded values
+                turn_cmd, roll_cmd = mod.last_command
+                # Get the latest feedback (position) for both turning and rolling motors
+                turn_fb, _ = self.feedback.feedback.get(mod.turn_motor.node_id, (0.0, 0.0))
+                roll_fb, _ = self.feedback.feedback.get(mod.roll_motor.node_id, (0.0, 0.0))
+                logging.info(f"Module {i}: Turn Cmd = {turn_cmd:.3f} turns/s, Roll Cmd = {roll_cmd:.3f} turns/s, "
+                             f"Turn FB = {turn_fb:.3f} turns, Roll FB = {roll_fb:.3f} turns")
+
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
     # Get properties for the right joystick's horizontal axis (rotation)
