@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
 """
 3-Wheel Holonomic Base with Powered Caster Drive Using Joystick Control (via evdev)
 
 This script:
-  1) Loads motor_config.json for each ODrive node (including flip and offset).
+  1) Loads motor_config.json for each ODrive node (including flip, offset, and optionally wheel_positions).
   2) Spawns a background thread to parse ODrive encoder feedback.
   3) Sets rolling motors to a 5A current limit.
   4) Uses Ruckig for advanced command smoothing in 3 DOFs (vx, vy, ω).
@@ -35,7 +36,7 @@ CURRENT_LIMIT_ROLLING = 5.0    # 5 A current limit for rolling motors
 VEL_LIMIT_ROLLING = 2          # Example velocity limit in turns/s
 
 MAX_LINEAR_VEL = 1.0   # Maximum forward velocity (in turns/s, or your chosen unit)
-MAX_ANG_VEL    = 0.5   # Maximum angular velocity (in turns/s for turning)
+MAX_ANG_VEL    = 3     # Maximum angular velocity (in turns/s for turning)
 
 # Joystick parameters
 JOYSTICK_DEADZONE = 0.1
@@ -80,13 +81,20 @@ def set_input_pos(bus, node_id, pos):
     arbid = to_arbid(node_id, FUNC_SET_INPUT_POS)
     data = struct.pack('<fhh', pos, 0, 0)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
-    bus.send(msg)
+    # Catch transmit errors to avoid crashing if the buffer is full.
+    try:
+        bus.send(msg)
+    except can.CanOperationError as e:
+        print(f"Warning: Could not send position command for node {node_id}: {e}")
 
 def set_input_vel(bus, node_id, vel):
     arbid = to_arbid(node_id, FUNC_SET_INPUT_VEL)
     data = struct.pack('<ff', vel, 0.0)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
-    bus.send(msg)
+    try:
+        bus.send(msg)
+    except can.CanOperationError as e:
+        print(f"Warning: Could not send velocity command for node {node_id}: {e}")
 
 # ========= BACKGROUND FEEDBACK THREAD =========
 class ODriveFeedbackCollector(threading.Thread):
@@ -164,10 +172,10 @@ class SwerveModule:
         self.turn_motor.command_position(steer_angle_in_turns)
         self.roll_motor.command_velocity(roll_vel_in_turns_s)
 
-# ========= Helper: Generate Wheel Geometry =========
+# ========= Helper: Generate or Load Wheel Geometry =========
 def generate_wheel_positions(num_wheels, robot_size):
     if num_wheels == 3:
-        # Arrange 3 wheels in an equilateral triangle.
+        # Default: arrange 3 wheels in an equilateral triangle.
         R = robot_size / 2  # radius of circumscribed circle
         positions = []
         for i in range(3):
@@ -200,9 +208,9 @@ class SwerveVehicle:
     Inverse kinematics for a powered caster design is applied: each module’s effective 
     wheel velocity is computed as:
          v_module = [vx, vy] + ω * [-y_effective, x_effective]
-    where x_effective,y_effective = nominal position + caster offset (in radial direction).
+    where (x_effective,y_effective) = nominal_position + caster_offset_vector.
     """
-    def __init__(self, bus, feedback_collector, module_list, robot_size, num_wheels, caster_offset):
+    def __init__(self, bus, feedback_collector, module_list, robot_size, num_wheels, caster_offset, nominal_wheel_positions=None):
         self.bus = bus
         self.modules = module_list
         self.feedback = feedback_collector
@@ -223,7 +231,11 @@ class SwerveVehicle:
         self.robot_size = robot_size
         self.num_wheels = num_wheels
         self.caster_offset = caster_offset
-        self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
+        if nominal_wheel_positions is None:
+            self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
+        else:
+            # Use the user-provided configuration
+            self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
 
     def start(self):
         self.ctrl_thread.start()
@@ -251,7 +263,6 @@ class SwerveVehicle:
                 time.sleep(CONTROL_PERIOD - dt)
             last_t = now
 
-            # Check for new command from joystick thread
             if not self.cmd_queue.empty():
                 cmd = self.cmd_queue.get_nowait()
                 if cmd["type"] == "vel":
@@ -261,7 +272,7 @@ class SwerveVehicle:
             self.out.pass_to_input(self.inp)
             vx, vy, omega = self.out.new_velocity
 
-            # Compute commands for each module.
+            # For each module, compute the effective command.
             for i, mod in enumerate(self.modules):
                 nominal = self.nominal_wheel_positions[i]
                 norm = np.linalg.norm(nominal)
@@ -273,10 +284,9 @@ class SwerveVehicle:
                 angle = math.atan2(v_total[1], v_total[0])
                 angle_turns = angle / (2 * math.pi)
                 mod.command(angle_turns, speed)
-    
+
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
-    # Get calibration info...
     absinfo_y = joystick.absinfo(ecodes.ABS_Y)
     absinfo_x = joystick.absinfo(ecodes.ABS_X)
     center_y = (absinfo_y.min + absinfo_y.max) / 2
@@ -286,7 +296,6 @@ def joystick_input_thread(vehicle, joystick):
     print(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}, center={center_y}")
     print(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}, center={center_x}")
 
-    # Initialize defaults
     norm_y = 0.0
     norm_x = 0.0
 
@@ -294,7 +303,7 @@ def joystick_input_thread(vehicle, joystick):
         if event.type == ecodes.EV_ABS:
             if event.code == ecodes.ABS_Y:
                 val_y = event.value
-                norm_y = (center_y - val_y) / range_y  # invert for forward positive
+                norm_y = (center_y - val_y) / range_y  # invert: lower value means forward
                 norm_y = norm_y if abs(norm_y) > JOYSTICK_DEADZONE else 0.0
             elif event.code == ecodes.ABS_X:
                 val_x = event.value
@@ -302,25 +311,21 @@ def joystick_input_thread(vehicle, joystick):
                 norm_x = norm_x if abs(norm_x) > JOYSTICK_DEADZONE else 0.0
 
             target_vx = norm_y * JOYSTICK_SCALE_V
-            target_vy = 0.0  # not used in this demo
+            target_vy = 0.0  # Lateral not used in this demo
             target_omega = norm_x * JOYSTICK_SCALE_W
             vehicle.set_target_velocity([target_vx, target_vy, target_omega])
             time.sleep(0.005)
 
-
 # ========= MAIN SCRIPT =========
 def main():
-    # 1) Load motor_config.json
     if not os.path.exists(MOTOR_CONFIG_FILE):
         print(f"Error: missing {MOTOR_CONFIG_FILE}. Please create it.")
         sys.exit(1)
     with open(MOTOR_CONFIG_FILE, 'r') as f:
         mcfg = json.load(f)
 
-    # 2) Create CAN bus (adjust device name as needed)
     bus = can.interface.Bus("can0", interface="socketcan")
 
-    # 3) Create ODriveMotor objects
     turning_motors = []
     rolling_motors = []
     for nid in TURNING_NODE_IDS:
@@ -334,12 +339,10 @@ def main():
         m = ODriveMotor(bus, nid, offset, flip, is_turning=False)
         rolling_motors.append(m)
 
-    # 4) Pair into swerve modules (expecting 3 modules)
     modules = []
     for i in range(len(turning_motors)):
         modules.append(SwerveModule(turning_motors[i], rolling_motors[i]))
 
-    # 5) Clear errors, set closed-loop, and set rolling motor limits
     for mod in modules:
         mod.clear_errors()
         time.sleep(0.05)
@@ -349,11 +352,10 @@ def main():
         time.sleep(0.05)
         mod.set_rolling_limits(VEL_LIMIT_ROLLING, CURRENT_LIMIT_ROLLING)
 
-    # 6) Start background feedback collector
     fb_collector = ODriveFeedbackCollector(bus)
 
-    # 7) Locate a joystick device using evdev
-    from evdev import list_devices
+    # Use evdev to detect a Bluetooth joystick.
+    from evdev import list_devices, InputDevice
     devices = [InputDevice(path) for path in list_devices()]
     joystick = None
     for dev in devices:
@@ -364,19 +366,28 @@ def main():
         print("No joystick detected! Exiting.")
         sys.exit(1)
     print(f"Joystick detected: {joystick.name}")
+    absinfo_y = joystick.absinfo(ecodes.ABS_Y)
+    absinfo_x = joystick.absinfo(ecodes.ABS_X)
+    print(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}")
+    print(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}")
 
-    # 8) Create the SwerveVehicle with desired geometry settings.
-    robot_size = 0.350    # Adjust as needed (units consistent with ODrive configuration)
+    robot_size = 0.350   # Adjust as needed
     num_wheels = 3
-    caster_offset = 0.015  # Adjust caster offset as needed
-    vehicle = SwerveVehicle(bus, fb_collector, modules, robot_size, num_wheels, caster_offset)
+    caster_offset = 0.015  # Adjust as needed
+
+    # Check if motor_config.json includes a global "wheel_positions" entry.
+    if "wheel_positions" in mcfg:
+        nominal_wheel_positions = [np.array(pos) for pos in mcfg["wheel_positions"]]
+        print("Using configured wheel positions from motor_config.json")
+    else:
+        nominal_wheel_positions = None
+
+    vehicle = SwerveVehicle(bus, fb_collector, modules, robot_size, num_wheels, caster_offset, nominal_wheel_positions)
     vehicle.start()
 
-    # 9) Start a separate thread to process joystick input via evdev.
     js_thread = threading.Thread(target=joystick_input_thread, args=(vehicle, joystick), daemon=True)
     js_thread.start()
 
-    # 10) Run until KeyboardInterrupt.
     try:
         print("Control loop started. Use your joystick to drive the robot.")
         while True:
