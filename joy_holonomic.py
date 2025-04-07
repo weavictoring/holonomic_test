@@ -309,50 +309,61 @@ class SwerveVehicle:
     
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
-    """
-    Joystick thread that polls button states instead of analog axes.
-    Button mapping:
-      - BTN_SOUTH: forward (vx = +MAX_LINEAR_VEL)
-      - BTN_NORTH: backward (vx = -MAX_LINEAR_VEL)
-      - BTN_TR: rotate right (ω = +MAX_ANG_VEL)
-      - BTN_TL: rotate left (ω = -MAX_ANG_VEL)
-      - BTN_SELECT: clear errors (edge-triggered)
-    """
-    logging.info(f"Joystick detected: {joystick.name}")
-    prev_clear_error_state = False  # For edge detection on clear errors button
+    # Get properties for the right joystick's horizontal axis (rotation)
+    try:
+        absinfo_rx = joystick.absinfo(ecodes.ABS_RX)
+        center_rx = (absinfo_rx.min + absinfo_rx.max) / 2
+        range_rx = (absinfo_rx.max - center_rx)
+        logging.info(f"Joystick ABS_RX: min={absinfo_rx.min}, max={absinfo_rx.max}, center={center_rx}")
+    except Exception as e:
+        logging.error("ABS_RX not available on this joystick; rotation control may not work.")
+        center_rx = 0.0
+        range_rx = 1.0
 
-    while True:
-        # Get the set of currently pressed button codes.
-        active = joystick.active_keys()  # Returns a tuple of key codes that are pressed.
-        
-        # Initialize command velocities
-        vx = 0.0
-        omega = 0.0
-        # vy remains 0 in this mapping
-        
-        # Map buttons to velocity commands:
-        if ecodes.BTN_SOUTH in active:
-            vx += MAX_LINEAR_VEL
-        if ecodes.BTN_NORTH in active:
-            vx -= MAX_LINEAR_VEL
-        
-        if ecodes.BTN_TR in active:
-            omega += MAX_ANG_VEL
-        if ecodes.BTN_TL in active:
-            omega -= MAX_ANG_VEL
+    # For D-pad translation, we expect discrete values on ABS_HAT0X and ABS_HAT0Y.
+    # Log their info if available.
+    try:
+        absinfo_hat0x = joystick.absinfo(ecodes.ABS_HAT0X)
+        absinfo_hat0y = joystick.absinfo(ecodes.ABS_HAT0Y)
+        logging.info(f"Joystick ABS_HAT0X: min={absinfo_hat0x.min}, max={absinfo_hat0x.max}")
+        logging.info(f"Joystick ABS_HAT0Y: min={absinfo_hat0y.min}, max={absinfo_hat0y.max}")
+    except Exception as e:
+        logging.warning("D-pad (ABS_HAT0X/ABS_HAT0Y) info not available on this device.")
 
-        # Set the target velocity command for the vehicle.
-        vehicle.set_target_velocity([vx, 0.0, omega])
-        
-        # Clear errors on edge trigger for BTN_SELECT.
-        clear_error_now = ecodes.BTN_SELECT in active
-        if clear_error_now and not prev_clear_error_state:
-            logging.info("Clear errors button pressed; clearing errors on all modules.")
-            for mod in vehicle.modules:
-                mod.clear_errors()
-        prev_clear_error_state = clear_error_now
-        
-        time.sleep(0.05)  # Update at 20 Hz (adjust as needed)
+    # Initialize state variables.
+    dpad_x = 0  # Left/right for lateral translation (vy)
+    dpad_y = 0  # Up/down for forward/backward (vx)
+    rotation_val = 0.0  # Normalized right joystick value for rotation
+
+    for event in joystick.read_loop():
+        if event.type == ecodes.EV_ABS:
+            if event.code == ecodes.ABS_HAT0X:
+                dpad_x = event.value  # Typically -1 (left), 0 (center), or 1 (right)
+            elif event.code == ecodes.ABS_HAT0Y:
+                dpad_y = event.value  # Typically -1 (up) or 1 (down)
+            elif event.code == ecodes.ABS_RX:
+                # Normalize the right stick's X axis.
+                norm_rx = (event.value - center_rx) / range_rx
+                if abs(norm_rx) < JOYSTICK_DEADZONE:
+                    norm_rx = 0.0
+                rotation_val = norm_rx
+
+            # For translation, we map:
+            # - Up on the D-pad (usually reported as -1) to positive forward velocity.
+            # - Left/right are used directly.
+            target_vx = (-dpad_y) * JOYSTICK_SCALE_V
+            target_vy = dpad_x * JOYSTICK_SCALE_V
+            target_omega = rotation_val * JOYSTICK_SCALE_W
+
+            vehicle.set_target_velocity([target_vx, target_vy, target_omega])
+            time.sleep(0.005)
+
+        elif event.type == ecodes.EV_KEY:
+            # When BTN_SOUTH is pressed, clear errors on all modules.
+            if event.code == ecodes.BTN_SOUTH and event.value == 1:
+                logging.info("Clear errors button pressed; clearing errors on all modules.")
+                for mod in vehicle.modules:
+                    mod.clear_errors()
 
 
 # ========= MAIN SCRIPT =========
