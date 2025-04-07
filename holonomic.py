@@ -1,364 +1,391 @@
 #!/usr/bin/env python3
 
 """
-Demonstration code combining:
- - ODrive CAN control of 3 swerve modules (6 motors total).
- - Ruckig-based advanced motion planning (similar to the Phoenix 6 approach).
- - A real-time control loop at ~250 Hz.
- - Setting rolling motor current limits to 5A.
+Demonstration script that:
+1) Loads motor_config.json for each ODrive node => flip, offset
+2) Spawns a background thread to parse ODrive encoder feedback (ENCODER_ESTIMATES, 0x09)
+3) Sets rolling motors to a 5A current limit
+4) Uses Ruckig for advanced control
+5) Commands turning motors with position = offset + flip * desiredAngle
+   and rolling motors with velocity = flip * desiredVelocity
+6) Runs at ~250 Hz, but do adapt as needed
 
-IMPORTANT: This is only a skeleton example. Adapt to your geometry, gear ratios,
-encoder offsets, node IDs, etc. Thoroughly test in safe conditions!
+Adapt carefully to your real swerve geometry, calibration, offsets, units, etc.
 
 Dependencies:
- - python-can (for ODrive CAN)
- - ruckig (for trajectory generation)
- - Possibly threadpoolctl (if you want to limit BLAS usage)
+ - python-can
+ - ruckig
+ - (optional) threadpoolctl if you want to limit BLAS usage
+
+Test carefully at low current & speed with the robot wheels off the ground!
 """
 
 import os
 import sys
-import time
 import math
+import json
+import time
 import queue
 import signal
-import threading
 import struct
-
+import threading
 import can
 import ruckig
 import numpy as np
 
-# =====================
-# USER CONSTANTS
-# =====================
-CONTROL_FREQ = 50         # 250 Hz control loop
+# ========= USER CONFIG =========
+CONTROL_FREQ = 50
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ
-SWERVE_MODULE_COUNT = 3       # We have 3 modules => 6 motors
 
-# ODrive node ID assignments
-# Turning motors:  [0, 2, 4]
-# Rolling motors:  [1, 3, 5]
 TURNING_NODE_IDS = [0, 2, 4]
 ROLLING_NODE_IDS = [1, 3, 5]
 ALL_NODE_IDS = TURNING_NODE_IDS + ROLLING_NODE_IDS
 
-# We’ll set 5 A max motor current for rolling motors
-CURRENT_LIMIT_ROLLING = 5.0
+CURRENT_LIMIT_ROLLING = 5.0  # 5 A limit for rolling motors
+VEL_LIMIT_ROLLING = 2     # example velocity limit in "turns/s" – adjust as needed
 
-# Example: velocity limits (m/s or rad/s in your operational space) – up to you
-MAX_LINEAR_VEL = 0.5   # m/s (example)
-MAX_LINEAR_ACC = 0.25  # m/s^2
-MAX_ANG_VEL = 1.0      # rad/s
-MAX_ANG_ACC = 0.5      # rad/s^2
+# If you do advanced 2D control, let's say we have 3 DOFs: (vx, vy, w).
+# We'll keep this example simpler: just command a single linear velocity & single turning angle
+MAX_LINEAR_VEL = 1.0   # Example: 1 turn/s or a placeholder if you do actual  m/s
+MAX_ANG_VEL = 0.5      # Example: 0.5 turns/s for turning. Adjust to your liking
 
-# =====================
-# ODRIVE CAN PROTOCOL
-# =====================
-FUNC_SET_AXIS_STATE    = 0x07
-FUNC_CLEAR_ERRORS      = 0x08
-FUNC_SET_LIMITS        = 0x11
-FUNC_SET_INPUT_POS     = 0x0C
-FUNC_SET_INPUT_VEL     = 0x0D
-FUNC_GET_ENCODER_EST   = 0x09
-FUNC_HEARTBEAT         = 0x01
+# Paths
+MOTOR_CONFIG_FILE = "motor_config.json"
 
-AXIS_STATE_IDLE            = 1
-AXIS_STATE_CLOSED_LOOP     = 8
+# ========= ODrive CAN PROTOCOL =========
+FUNC_SET_AXIS_STATE  = 0x07
+FUNC_CLEAR_ERRORS    = 0x08
+FUNC_SET_LIMITS      = 0x11
+FUNC_SET_INPUT_POS   = 0x0C
+FUNC_SET_INPUT_VEL   = 0x0D
+FUNC_ENCODER_EST     = 0x09
+FUNC_HEARTBEAT       = 0x01
 
-def to_arbid(node_id, func_code):
-    return (node_id << 5) | func_code
+AXIS_STATE_IDLE          = 1
+AXIS_STATE_CLOSED_LOOP   = 8
 
-# Helper: set axis state
+def to_arbid(node_id, func):
+    return (node_id << 5) | func
+
 def set_axis_state(bus, node_id, state):
     arbid = to_arbid(node_id, FUNC_SET_AXIS_STATE)
     data = struct.pack('<I', state)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
     bus.send(msg)
 
-# Helper: clear errors
 def clear_errors(bus, node_id):
     arbid = to_arbid(node_id, FUNC_CLEAR_ERRORS)
     msg = can.Message(arbitration_id=arbid, data=[], is_extended_id=False)
     bus.send(msg)
 
-# Helper: set velocity/current limit
 def set_limits(bus, node_id, vel_limit, curr_limit):
-    # According to ODrive docs, Set_Limits (0x11) => <float velocity_limit, float current_limit>
     arbid = to_arbid(node_id, FUNC_SET_LIMITS)
     data = struct.pack('<ff', vel_limit, curr_limit)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
     bus.send(msg)
 
-# Helper: set input position
 def set_input_pos(bus, node_id, pos):
+    """
+    ODrive expects <float position, int16 velocity_ff, int16 torque_ff>, all little-endian
+    'pos' is in turns. E.g. 1.0 => 1 turn => 2π rad if you're in default config
+    """
     arbid = to_arbid(node_id, FUNC_SET_INPUT_POS)
-    # <float position, int16 velocity_ff, int16 torque_ff>
     data = struct.pack('<fhh', pos, 0, 0)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
     bus.send(msg)
 
-# Helper: set input velocity
 def set_input_vel(bus, node_id, vel):
+    """
+    ODrive expects <float velocity, float torque_ff>
+    'vel' is in turns/s
+    """
     arbid = to_arbid(node_id, FUNC_SET_INPUT_VEL)
-    # <float velocity, float torque_ff>
     data = struct.pack('<ff', vel, 0.0)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
     bus.send(msg)
 
-# =====================
-# CLASSES
-# =====================
+# ========= BACKGROUND FEEDBACK THREAD =========
+class ODriveFeedbackCollector(threading.Thread):
+    """
+    A daemon thread that listens to 'bus.recv()'
+    and captures ENCODER_ESTIMATES (pos, vel) for each node.
+    The raw feedback is stored in a dict: feedback[node_id] = (pos, vel)
+    'pos' and 'vel' are in ODrive "turns" and "turns/s" by default.
+    """
+    def __init__(self, bus):
+        super().__init__()
+        self.bus = bus
+        self.daemon = True
+        self.run_flag = True
+        # We store the raw pos, vel in a thread-safe dict
+        self.feedback = {}
+        for nid in ALL_NODE_IDS:
+            self.feedback[nid] = (0.0, 0.0)
 
+    def run(self):
+        while self.run_flag:
+            msg = self.bus.recv(timeout=0.1)
+            if not msg:
+                continue
+            func = (msg.arbitration_id & 0x1F)
+            node_id = msg.arbitration_id >> 5
+            # Check if it's a response or broadcast of ENCODER_ESTIMATES
+            # According to ODrive docs, broadcast uses ID = node<<5 | 0x09
+            if func == FUNC_ENCODER_EST and node_id in ALL_NODE_IDS:
+                # parse <float pos, float vel> in little-endian
+                pos, vel = struct.unpack('<ff', msg.data)
+                self.feedback[node_id] = (pos, vel)
+
+    def stop(self):
+        self.run_flag = False
+
+# ========= MOTOR WRAPPERS =========
 class ODriveMotor:
     """
-    Simple wrapper for an ODrive motor node.
-    - turning = True => handle as “steering” motor
-    - turning = False => handle as “rolling” motor
+    Simple wrapper for a single ODrive node, with offset & flip from motor_config.json
     """
-    def __init__(self, bus, node_id, turning=False):
+    def __init__(self, bus, node_id, offset=0.0, flip=1.0, is_turning=False):
         self.bus = bus
         self.node_id = node_id
-        self.turning = turning
-
-    def set_idle(self):
-        set_axis_state(self.bus, self.node_id, AXIS_STATE_IDLE)
-
-    def set_closed_loop(self):
-        set_axis_state(self.bus, self.node_id, AXIS_STATE_CLOSED_LOOP)
+        self.offset = offset
+        self.flip = flip
+        self.is_turning = is_turning
 
     def clear_errors(self):
         clear_errors(self.bus, self.node_id)
 
-    def set_limits(self, vel_limit, curr_limit):
-        set_limits(self.bus, self.node_id, vel_limit, curr_limit)
+    def set_closed_loop(self):
+        set_axis_state(self.bus, self.node_id, AXIS_STATE_CLOSED_LOOP)
 
-    def set_pos(self, pos):
-        """
-        If a turning motor is commanded in position mode,
-        e.g. pos in [turns], or [rad/(2*pi)] depending on your preference.
-        """
-        set_input_pos(self.bus, self.node_id, pos)
+    def set_idle(self):
+        set_axis_state(self.bus, self.node_id, AXIS_STATE_IDLE)
 
-    def set_vel(self, vel):
+    def set_limits(self, vel_lim, curr_lim):
+        set_limits(self.bus, self.node_id, vel_lim, curr_lim)
+
+    def command_position(self, raw_angle):
         """
-        If a rolling motor is commanded in velocity mode,
-        e.g. vel in [turns/s], or [rad/(2*pi) / s].
+        'raw_angle' is your final ODrive 'turns'.
+        Typically = offset + flip*(some angle in turns).
         """
-        set_input_vel(self.bus, self.node_id, vel)
+        set_input_pos(self.bus, self.node_id, raw_angle)
+
+    def command_velocity(self, raw_vel):
+        """
+        'raw_vel' is your final ODrive velocity in turns/s.
+        Typically = flip*(some commanded speed).
+        """
+        set_input_vel(self.bus, self.node_id, raw_vel)
 
 class SwerveModule:
     """
-    A single swerve module with:
-      - 1 turning motor
-      - 1 rolling motor
+    One swerve module with a turning motor + rolling motor
     """
-    def __init__(self, bus, turn_node, roll_node):
-        self.turn_motor = ODriveMotor(bus, turn_node, turning=True)
-        self.roll_motor = ODriveMotor(bus, roll_node, turning=False)
-
-    def set_idle(self):
-        self.turn_motor.set_idle()
-        self.roll_motor.set_idle()
-
-    def set_closed_loop(self):
-        self.turn_motor.set_closed_loop()
-        self.roll_motor.set_closed_loop()
+    def __init__(self, turn_motor, roll_motor):
+        self.turn_motor = turn_motor
+        self.roll_motor = roll_motor
 
     def clear_errors(self):
         self.turn_motor.clear_errors()
         self.roll_motor.clear_errors()
 
-    def set_rolling_limit(self, vel_limit, curr_limit):
-        """
-        For rolling motors, we might want to do something like:
-        set_limits( ~some velocity limit in turns/s~, 5.0 )
-        """
+    def set_closed_loop(self):
+        self.turn_motor.set_closed_loop()
+        self.roll_motor.set_closed_loop()
+
+    def set_idle(self):
+        self.turn_motor.set_idle()
+        self.roll_motor.set_idle()
+
+    def set_rolling_limits(self, vel_limit, curr_limit):
         self.roll_motor.set_limits(vel_limit, curr_limit)
 
-    def command(self, steer_cmd, roll_cmd):
+    def command(self, steer_angle_in_turns, roll_vel_in_turns_s):
         """
-        Example: 
-          steer_cmd = steering angle or steering velocity (in “turns or rad/(2*pi)“).
-          roll_cmd  = rolling velocity (turns/s).
-        In a real system you might do:
-         - position mode for steering
-         - velocity mode for rolling
+        Example usage:
+          steer_angle_in_turns = offset + flip * desiredAngle
+          roll_vel_in_turns_s  = flip * desiredVelocity
         """
-        # For demonstration, let's do:
-        #  - Steering in position control (just as an example)
-        #  - Rolling in velocity control
-        self.turn_motor.set_pos(steer_cmd)
-        self.roll_motor.set_vel(roll_cmd)
+        self.turn_motor.command_position(steer_angle_in_turns)
+        self.roll_motor.command_velocity(roll_vel_in_turns_s)
 
-
+# ========= VEHICLE CLASS WITH RUCKIG LOOP =========
 class SwerveVehicle:
     """
-    Full vehicle with 3 swerve modules (6 motors).
-    Uses Ruckig for advanced trajectory generation (like your code snippet).
-    Real-time loop at 250 Hz.
+    3 swerve modules => 6 motors total. 
+    We'll do a single advanced control loop at ~250 Hz using Ruckig, 
+    commanding (some linear velocity, maybe an orientation, etc.)
+    This is a simplified demonstration, ignoring real geometry.
     """
+    def __init__(self, bus, feedback_collector, module_list):
+        self.bus = bus
+        self.modules = module_list
+        self.feedback = feedback_collector  # background thread storing raw pos, vel
+        # Start feedback
+        self.feedback.start()
 
-    def __init__(self):
-        # Setup CAN
-        self.bus = can.interface.Bus("can0", bustype="socketcan")
+        # Ruckig setup – let's say 1-DOF for demonstration: target forward velocity
+        # If you want 3 DOFs (vx, vy, w), set dofs=3, etc.
+        self.dofs = 1
+        self.rk = ruckig.Ruckig(self.dofs, CONTROL_PERIOD)
+        self.inp = ruckig.InputParameter(self.dofs)
+        self.out = ruckig.OutputParameter(self.dofs)
 
-        # Create 3 modules
-        self.modules = [
-            SwerveModule(self.bus, TURNING_NODE_IDS[i], ROLLING_NODE_IDS[i])
-            for i in range(SWERVE_MODULE_COUNT)
-        ]
-
-        # Clear errors, set closed-loop, set rolling motor current limits
-        for mod in self.modules:
-            mod.clear_errors()
-            time.sleep(0.05)
-        for mod in self.modules:
-            mod.set_closed_loop()
-            time.sleep(0.05)
-        # Example: set rolling motor current limit = 5 A, velocity limit = ??? (30 turns/s?)
-        for mod in self.modules:
-            mod.set_rolling_limit(30.0, CURRENT_LIMIT_ROLLING)
-
-        # Setup Ruckig. We’ll do a 3-DOF example: (vx, vy, w) in “global” coords,
-        # or you might do something simpler. 
-        self.n_dofs = 3
-        self.ruckig = ruckig.Ruckig(self.n_dofs, CONTROL_PERIOD)
-        self.inp = ruckig.InputParameter(self.n_dofs)
-        self.out = ruckig.OutputParameter(self.n_dofs)
-        # Max velocity, acceleration for: (vx, vy, w)
-        self.inp.max_velocity = [MAX_LINEAR_VEL, MAX_LINEAR_VEL, MAX_ANG_VEL]
-        self.inp.max_acceleration = [MAX_LINEAR_ACC, MAX_LINEAR_ACC, MAX_ANG_ACC]
-        self.inp.current_position = [0.0, 0.0, 0.0]  # starting
-        self.inp.current_velocity = [0.0, 0.0, 0.0]
-
-        # Start with a velocity command
-        # We'll do velocity control in Ruckig (like "control_interface = Velocity")
+        # Max velocity, accel
+        self.inp.max_velocity = [MAX_LINEAR_VEL]
+        self.inp.max_acceleration = [0.5 * MAX_LINEAR_VEL]  # example
+        self.inp.current_position = [0.0]
+        self.inp.current_velocity = [0.0]
         self.inp.control_interface = ruckig.ControlInterface.Velocity
-        self.inp.target_velocity = [0.0, 0.0, 0.0]
+        self.inp.target_velocity = [0.0]
 
-        # Real-time thread
-        self.command_queue = queue.Queue(maxsize=1)
-        self.run_thread = True
-        self.control_thread = threading.Thread(target=self.control_loop, daemon=True)
+        self.cmd_queue = queue.Queue(maxsize=1)
+        self.run_flag = True
+        self.ctrl_thread = threading.Thread(target=self.control_loop, daemon=True)
 
-    def start_control(self):
-        self.control_thread.start()
+    def start(self):
+        self.ctrl_thread.start()
 
-    def stop_control(self):
-        self.run_thread = False
-        self.control_thread.join()
-        # Put modules into IDLE
-        for mod in self.modules:
-            mod.set_idle()
+    def stop(self):
+        self.run_flag = False
+        self.ctrl_thread.join()
+        self.feedback.stop()
+        # Put modules in IDLE
+        for m in self.modules:
+            m.set_idle()
+
+    def set_target_velocity(self, v):
+        """
+        Sets new 1D velocity for demonstration.
+        If you want multi-DOF, do e.g. target_velocity=[vx,vy,w].
+        """
+        if self.cmd_queue.full():
+            print("Warning: command queue is full.")
+        else:
+            self.cmd_queue.put({"type":"vel","value":v}, block=False)
 
     def control_loop(self):
         """
-        Main ~250 Hz loop, reading from Ruckig to get (vx_d, vy_d, w_d).
-        Then we must figure out each module’s steering + rolling velocities/positions.
-        For simplicity here, we do a naive approach:
-         - Each module is at some angle (we’re ignoring real feedback in this snippet).
-         - Command rolling velocity = magnitude
-         - Command steering angle = direction
+        ~250 Hz. 
+        Example approach:
+          - read Ruckig output => final velocity
+          - compute each module's turning angle & wheel velocity
+          - apply offset+flip to turning angle
+          - apply flip to rolling velocity
+          - send to ODrive
         """
-        last_time = time.time()
-        while self.run_thread:
-            # Timing
-            t0 = time.time()
-            dt = t0 - last_time
+        last_t = time.time()
+        while self.run_flag:
+            now = time.time()
+            dt = now - last_t
             if dt < CONTROL_PERIOD:
                 time.sleep(CONTROL_PERIOD - dt)
-            last_time = t0
+            last_t = now
 
-            # If a new command arrived, update Ruckig’s target velocity
-            if not self.command_queue.empty():
-                new_cmd = self.command_queue.get_nowait()
-                if new_cmd["type"] == "velocity":
-                    # e.g. new_cmd["vel"] = [vx, vy, w]
-                    self.inp.control_interface = ruckig.ControlInterface.Velocity
-                    self.inp.target_velocity = new_cmd["vel"]
+            # Check new command
+            if not self.cmd_queue.empty():
+                cmd = self.cmd_queue.get_nowait()
+                if cmd["type"] == "vel":
+                    self.inp.target_velocity = [cmd["value"]]
 
-            # Update Ruckig
-            res = self.ruckig.update(self.inp, self.out)
-            self.out.pass_to_input(self.inp)  # recommended for next iteration
+            # Run Ruckig
+            self.rk.update(self.inp, self.out)
+            self.out.pass_to_input(self.inp)
+            v_d = self.out.new_velocity[0]
 
-            # Current commanded velocity in the “global” frame
-            vx_d, vy_d, w_d = self.out.new_velocity
+            # For demonstration: 
+            #   We'll just command each module to the same steer angle = 0,
+            #   rolling velocity = v_d. 
+            # Real swerve geometry would do a proper inverse kinematics.
+            # Then apply offset+flip for turning, flip for rolling.
 
-            # Example: naive swerve “inverse kinematics”
-            # Just for demonstration: each of 3 modules spaced 120° around center
-            # Real code: you’d do a more thorough transform based on module geometry
-            # We'll do (theta_module_i, speed_module_i)
-            # Here, let's just do an all-forward approach: each module’s steer=0, roll = same
-            # so the robot goes forward in vx_d.
-            # This is obviously oversimplified. Replace with your real transform.
+            # We DO have offset & flip data in each motor, so let's do:
+            # turningMotorFinalPos = offset + flip * desiredAngle
+            # rollingMotorFinalVel = flip * desiredVelocity
+            # We'll set desiredAngle=0 for demonstration.
 
-            # For demonstration:
-            #   - If vx_d or vy_d is nonzero, find heading angle = atan2(vy_d, vx_d)
-            #   - Rolling speed = sqrt(vx_d^2 + vy_d^2)
-            heading = math.atan2(vy_d, vx_d) if (abs(vx_d) + abs(vy_d) > 1e-6) else 0.0
-            speed = math.hypot(vx_d, vy_d)
-
-            # Then each module: set steer angle = heading + offset_i, set roll velocity = speed
-            # ignoring w_d (the rotational velocity) for brevity
-            # In real swerve, you'd incorporate w_d as well.
+            desired_steer_angle_in_turns = 0.0  # no turning
+            desired_roll_vel_in_turns_s = v_d   # naive
 
             # Command each module
-            for i, mod in enumerate(self.modules):
-                # offset_i for module i if you want them at different angles:
-                # For a 3-module robot, let's do 120 deg spacing maybe. But a simpler approach
-                # is just all modules are the same orientation. Up to you.
-                offset_i = 0.0
-                steer_angle = heading + offset_i
+            for mod in self.modules:
+                mod.command(desired_steer_angle_in_turns, desired_roll_vel_in_turns_s)
 
-                # For ODrive turning: let's assume 1.0 in “pos” = 1 turn.
-                # If you prefer rad-based, do: steer_angle / (2*pi).
-                # (We’re ignoring actual steer angle feedback here!)
-                steer_cmd_odrive = steer_angle / (2 * math.pi)
+            # We also have raw feedback in `self.feedback.feedback[node_id]`
+            # If you want real-time logging or closed-loop kinematics, read it here.
 
-                # Rolling velocity: in ODrive “turns/s”
-                roll_cmd_odrive = speed  # naive: 1 m/s => 1 turn/s? You must calibrate
-
-                mod.command(steer_cmd_odrive, roll_cmd_odrive)
-
-        # end while loop
-
-    def set_target_velocity(self, vx, vy, w):
-        """
-        Sends a velocity command in the global frame
-        """
-        cmd = {
-            "type": "velocity",
-            "vel": [vx, vy, w]
-        }
-        if self.command_queue.full():
-            print("Warning: command queue is full. Control loop might be stalled.")
-        else:
-            self.command_queue.put(cmd, block=False)
-
-
-# =====================
-# MAIN
-# =====================
-
+# ========= MAIN SCRIPT =========
 def main():
-    vehicle = SwerveVehicle()
-    vehicle.start_control()
+    # 1) Load motor_config
+    if not os.path.exists(MOTOR_CONFIG_FILE):
+        print(f"Error: missing {MOTOR_CONFIG_FILE}. Please create it.")
+        sys.exit(1)
+    with open(MOTOR_CONFIG_FILE, 'r') as f:
+        mcfg = json.load(f)  # dict of dict
 
+    # 2) Create CAN bus
+    bus = can.interface.Bus("can0", bustype="socketcan")
+
+    # 3) Clear errors, set closed-loop, set rolling current limit
+    #    Also create ODriveMotor objects
+    turning_motors = []
+    rolling_motors = []
+    for nid in TURNING_NODE_IDS:
+        offset = mcfg.get(str(nid), {}).get("offset", 0.0)
+        flip   = mcfg.get(str(nid), {}).get("flip", 1.0)
+        m = ODriveMotor(bus, nid, offset, flip, is_turning=True)
+        turning_motors.append(m)
+
+    for nid in ROLLING_NODE_IDS:
+        offset = mcfg.get(str(nid), {}).get("offset", 0.0)
+        flip   = mcfg.get(str(nid), {}).get("flip", 1.0)
+        m = ODriveMotor(bus, nid, offset, flip, is_turning=False)
+        rolling_motors.append(m)
+
+    # 4) Pair them into swerve modules
+    #    If you have 3 modules, we expect turning_motors[i] pairs with rolling_motors[i]
+    #    Adjust indexing carefully based on your real node ID layout
+    modules = []
+    for i in range(len(turning_motors)):
+        mod = SwerveModule(turning_motors[i], rolling_motors[i])
+        modules.append(mod)
+
+    # 5) Clear errors, set closed-loop, set rolling 5A limit
+    for mod in modules:
+        mod.clear_errors()
+        time.sleep(0.05)
+    time.sleep(0.2)
+
+    for mod in modules:
+        mod.set_closed_loop()
+        time.sleep(0.05)
+        mod.set_rolling_limits(VEL_LIMIT_ROLLING, CURRENT_LIMIT_ROLLING)
+
+    # 6) Start background feedback collector
+    fb_collector = ODriveFeedbackCollector(bus)
+
+    # 7) Create your advanced "vehicle" object with Ruckig or other logic
+    vehicle = SwerveVehicle(bus, fb_collector, modules)
+    vehicle.start()
+
+    # 8) Demo: ramp up velocity for 5 seconds, then stop
     try:
-        print("Sending a small circular velocity command for 10 seconds...")
-        t_start = time.time()
-        while time.time() - t_start < 10.0:
-            # Let’s do a slow circle
-            # vx=0.2 m/s forward, w=0.3 rad/s
-            vehicle.set_target_velocity(0.2, 0.0, 0.3)
+        print("Starting 5s demonstration: gradually ramp to velocity 0.5 turns/s")
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            # Example: set velocity 0.5 turns/s
+            vehicle.set_target_velocity(0.5)
             time.sleep(0.05)
 
+        print("Done. Setting velocity=0, stopping control in 2s...")
+        vehicle.set_target_velocity(0.0)
+        time.sleep(2.0)
+
     except KeyboardInterrupt:
-        print("KeyboardInterrupt - stopping control.")
+        print("CTRL+C - stopping.")
     finally:
-        print("Stopping control thread, setting motors IDLE.")
-        vehicle.stop_control()
+        vehicle.stop()
+        print("All done.")
 
 if __name__ == "__main__":
     main()
