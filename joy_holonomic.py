@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 
 # ========= USER CONFIG =========
-CONTROL_FREQ = 250
+CONTROL_FREQ = 50
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ
 
 TURNING_NODE_IDS = [0, 2, 4]
@@ -183,31 +183,25 @@ class SwerveModule:
 
 # ========= Helper: Generate Wheel Geometry =========
 def generate_wheel_positions(num_wheels, robot_size):
-    if num_wheels == 3:
-        # Arrange 3 wheels in an equilateral triangle.
-        R = robot_size / 2  # radius of circumscribed circle
-        positions = []
-        for i in range(3):
-            theta = math.radians(90 + i * 120)
-            positions.append(np.array([R * math.cos(theta), R * math.sin(theta)]))
-        return positions
-    else:
-        # Default: arrange along a square's perimeter.
-        half_size = robot_size / 2
-        perimeter = 4 * robot_size
-        positions = []
-        for i in range(num_wheels):
-            d = (i * perimeter) / num_wheels
-            if d < robot_size:
-                x = -half_size + d; y = half_size
-            elif d < 2 * robot_size:
-                x = half_size; y = half_size - (d - robot_size)
-            elif d < 3 * robot_size:
-                x = half_size - (d - 2 * robot_size); y = -half_size
-            else:
-                x = -half_size; y = -half_size + (d - 3 * robot_size)
-            positions.append(np.array([x, y]))
-        return positions
+    """
+    Generate default wheel positions arranged uniformly on a circle.
+    
+    Parameters:
+      num_wheels (int): Number of wheels.
+      robot_size (float): A characteristic dimension of the robot (e.g. the diameter).
+    
+    Returns:
+      List of np.array([x, y]) positions (in the robot's coordinate frame) for each wheel.
+      Here we use a circle of radius = robot_size / 2.
+    """
+    R = robot_size / 2.0
+    positions = []
+    for i in range(num_wheels):
+        angle = 2 * math.pi * i / num_wheels  # Uniformly distributed angles
+        x = R * math.cos(angle)
+        y = R * math.sin(angle)
+        positions.append(np.array([x, y]))
+    return positions
 
 # ========= VEHICLE CLASS WITH JOYSTICK (evdev) & RUCKIG CONTROL =========
 class SwerveVehicle:
