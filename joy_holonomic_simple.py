@@ -12,7 +12,7 @@ This script:
        - Rotation: from the right joystick (rotation about z)
      It factors in a caster offset for each wheel.
   6) Uses a proportional controller for the turning motors (driven in velocity mode) that drives them toward the desired turning angle.
-  7) Logs live status (commands and feedback), where the turn command is output as the desired angle.
+  7) Logs live status (commands and feedback), where the turn command is output as the desired angle in the range 0–1.
   8) Runs the control loop at ~50 Hz.
   
 Test carefully at low current & speed with the robot wheels off the ground!
@@ -160,7 +160,7 @@ class ODriveMotor:
         set_input_pos(self.bus, self.node_id, computed_angle)
     
     def command_velocity(self, raw_vel):
-        # For turning motors, the offset is not added.
+        # For turning motors, do not add the offset.
         computed_vel = self.flip * raw_vel if self.is_turning else self.offset + self.flip * raw_vel
         set_input_vel(self.bus, self.node_id, computed_vel)
         logging.debug(f"Node {self.node_id} velocity command: {computed_vel:.3f} turns/s")
@@ -193,7 +193,7 @@ class SwerveModule:
         self.roll_motor.set_limits(vel_limit, curr_limit)
     
     def command(self, turn_vel_command, roll_vel, desired_turn_angle):
-        # Save desired turn angle (in turns) and roll speed for live logging.
+        # Save desired turn angle (in turns, mapped to [0,1)) and roll speed for live logging.
         self.last_command = (desired_turn_angle, roll_vel)
         # Command the turning motor (velocity mode) and rolling motor.
         self.turn_motor.command_velocity(turn_vel_command)
@@ -225,11 +225,13 @@ class SwerveVehicle:
     
     For each module:
       - The rotation contribution is computed based on its nominal position (plus caster offset).
-      - The total wheel velocity vector is: [vx, vy] + ω * [-y_effective, x_effective].
-      - The desired turning angle (in turns) is derived from that vector.
-      - A proportional controller drives the turning motor toward the desired angle.
+      - The total wheel velocity vector is: v_total = [vx, vy] + ω * [-y_effective, x_effective]
+      - The desired turning angle is derived from v_total using atan2 and then mapped to [0, 1)
+        (i.e. 1 turn = 360°).
+      - The current feedback from the turning motor is also wrapped into [0, 1).
+      - A P-controller drives the turning motor velocity based on the difference between the desired and current angles.
     
-    Live status logging outputs the desired turning angle (in turns) and roll command.
+    Live logging outputs the desired turn angle and roll command.
     """
     def __init__(self, bus, feedback_collector, module_list, robot_size, num_wheels, caster_offset, nominal_wheel_positions=None):
         self.bus = bus
@@ -271,11 +273,10 @@ class SwerveVehicle:
         """
         Runs at CONTROL_FREQ Hz.
         For each module, compute:
-          - The rotational contribution based on module geometry.
-          - The total wheel velocity vector: v_total = [vx, vy] + ω * [-y_effective, x_effective]
-          - The desired wheel speed (magnitude) and desired turning angle.
-          - The error between desired and current turning angle, with wrapping.
-          - A P-controller computes the turning velocity command.
+          - The effective wheel velocity vector combining translation and rotation.
+          - The desired turning angle (in turns) is computed using atan2 and then wrapped to [0,1).
+          - The current turning angle is wrapped into [0,1).
+          - Error is computed as the smallest angular difference and fed into a P controller.
           - Commands are sent to the module.
         """
         last_t = time.time()
@@ -290,7 +291,7 @@ class SwerveVehicle:
             logging.debug(f"Target velocity: vx={vx:.3f}, vy={vy:.3f}, ω={omega:.3f}")
             
             for i, mod in enumerate(self.modules):
-                # Calculate the effective module position by adding caster offset.
+                # Calculate effective module position (adding caster offset)
                 nominal = self.nominal_wheel_positions[i]
                 norm = np.linalg.norm(nominal)
                 offset_vec = (nominal / norm) * self.caster_offset if norm != 0 else np.array([0.0, 0.0])
@@ -301,21 +302,23 @@ class SwerveVehicle:
                 # Total wheel velocity vector is the sum of translational and rotational components.
                 v_total = np.array([vx, vy]) + v_rot
                 roll_speed = np.linalg.norm(v_total)
-                # Compute the desired turning angle (in radians) from the velocity vector.
+                # Compute desired turning angle (radians) using atan2.
                 desired_angle = math.atan2(v_total[1], v_total[0])
-                # Convert desired angle to turns (1 turn = 2π radians).
-                desired_angle_turns = desired_angle / (2 * math.pi)
+                # Map desired_angle to turns in the range [0,1) using modulo.
+                desired_angle_turns = (desired_angle / (2 * math.pi)) % 1.0
                 
-                # Get current turning angle from feedback.
+                # Get current turning angle from feedback and wrap into [0,1).
                 current_angle, _ = self.feedback.feedback.get(mod.turn_motor.node_id, (0.0, 0.0))
-                # Compute angle error with wrapping.
+                current_angle = current_angle % 1.0
+                
+                # Compute angle error (smallest angular difference).
                 error = (desired_angle_turns - current_angle) % 1.0
                 if error > 0.5:
                     error -= 1.0
                 
                 # Proportional controller computes turning velocity command.
                 turn_vel_command = KP_TURN * error
-                # Clamp to ±MAX_TURN_VEL.
+                # Clamp turning velocity to ±MAX_TURN_VEL.
                 turn_vel_command = max(min(turn_vel_command, MAX_TURN_VEL), -MAX_TURN_VEL)
                 
                 # Command the module.
@@ -337,7 +340,7 @@ class SwerveVehicle:
                 roll_fb, _ = self.feedback.feedback.get(mod.roll_motor.node_id, (0.0, 0.0))
                 logging.info(f"Module {i}: Desired Turn Angle = {desired_turn_angle:.3f} turns, Roll Cmd = {roll_cmd:.3f} turns/s, "
                              f"Turn FB = {turn_fb:.3f} turns, Roll FB = {roll_fb:.3f} turns")
-
+                
 # ------------------ JOYSTICK INPUT THREAD ------------------
 def joystick_input_thread(vehicle, joystick):
     """
@@ -348,9 +351,9 @@ def joystick_input_thread(vehicle, joystick):
           * ABS_X: lateral (vy)
           * ABS_Y: forward/back (vx) [inverted so pushing forward yields positive vx]
       - Right joystick horizontal (ABS_RX) controls rotation (ω).
-      - BTN_SOUTH clears errors on all modules.
+      - BTN_SOUTH clears errors.
     
-    The translation vector [vx, vy] and rotational command ω are scaled by MAX_LINEAR_VEL and MAX_ANG_VEL respectively.
+    Translation [vx, vy] is scaled by MAX_LINEAR_VEL and rotation by MAX_ANG_VEL.
     """
     # Retrieve left stick properties for translation.
     try:
@@ -378,7 +381,6 @@ def joystick_input_thread(vehicle, joystick):
         center_rx = 0.0
         range_rx = 1.0
 
-    # Initialize normalized values.
     left_x = left_y = right_x = 0.0
     
     for event in joystick.read_loop():
@@ -467,7 +469,7 @@ def main():
         sys.exit(1)
     logging.info(f"Joystick detected: {joystick.name}")
     
-    # Log joystick axis info.
+    # Log some joystick axis info.
     try:
         absinfo_x = joystick.absinfo(ecodes.ABS_X)
         logging.info(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}")
