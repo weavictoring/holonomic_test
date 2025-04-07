@@ -9,15 +9,13 @@ This script:
   4) Uses Ruckig for advanced command smoothing in 3 DOFs (vx, vy, ω).
   5) Computes each module’s desired turning angle and rolling velocity from the 
      smoothed joystick commands, factoring in a caster offset.
-  6) Commands turning motors with:  offset + flip * (desiredAngle in turns)
-     and rolling motors with:   flip * desiredVelocity (in turns/s).
+  6) Commands turning motors in velocity mode using a position controller that computes 
+     a velocity command based on the error between the desired and current angle,
+     and rolling motors with:   offset + flip * desiredVelocity (in turns/s).
   7) Runs a control loop at ~50 Hz.
   8) Logs real-time output and errors.
 
-Joystick input is read via the evdev library. The joystick’s ABS_Y axis (inverted so that 
-pushing forward gives positive velocity) is used for forward/backward command, and the 
-ABS_X axis is used for turning command. Lateral (vy) is set to 0 here but could be extended.
-
+Joystick input is read via the evdev library.
 Test carefully at low current & speed with the robot wheels off the ground!
 """
 
@@ -46,9 +44,12 @@ VEL_LIMIT_ROLLING = 2          # Example velocity limit in turns/s
 MAX_LINEAR_VEL = 1.0   # Maximum forward velocity (in turns/s)
 MAX_ANG_VEL    = 3     # Maximum angular velocity (in turns/s)
 
+# New parameters for turning wheel position controller (velocity mode)
+KP_TURN = 2.0          # Proportional gain for turning error
+MAX_TURN_VEL = 1.0     # Maximum turning wheel velocity (in turns/s)
+
 # Joystick parameters
 JOYSTICK_DEADZONE = 0.1
-JOYSTICK_SCALE_V = MAX_LINEAR_VEL  
 JOYSTICK_SCALE_W = MAX_ANG_VEL     
 
 MOTOR_CONFIG_FILE = "motor_config.json"
@@ -150,13 +151,18 @@ class ODriveMotor:
         set_limits(self.bus, self.node_id, vel_lim, curr_lim)
 
     def command_position(self, raw_angle):
+        # Not used for turning motors in the new scheme
         logging.debug(f"Node {self.node_id} position command: {raw_angle:.3f} turns")
         computed_angle = self.offset + self.flip * raw_angle
         set_input_pos(self.bus, self.node_id, computed_angle)
 
     def command_velocity(self, raw_vel):
-        logging.debug(f"Node {self.node_id} velocity command: {raw_vel:.3f} turns/s")
-        computed_vel = self.offset + self.flip * raw_vel
+        # For turning motors, do not add the offset.
+        if self.is_turning:
+            computed_vel = self.flip * raw_vel
+        else:
+            computed_vel = self.offset + self.flip * raw_vel
+        logging.debug(f"Node {self.node_id} velocity command: {computed_vel:.3f} turns/s")
         set_input_vel(self.bus, self.node_id, computed_vel)
 
 class SwerveModule:
@@ -179,8 +185,9 @@ class SwerveModule:
     def set_rolling_limits(self, vel_limit, curr_limit):
         self.roll_motor.set_limits(vel_limit, curr_limit)
 
-    def command(self, steer_angle_in_turns, roll_vel_in_turns_s):
-        self.turn_motor.command_position(steer_angle_in_turns)
+    def command(self, turn_vel_command, roll_vel_in_turns_s):
+        # Command turning motor in velocity mode using the computed velocity command.
+        self.turn_motor.command_velocity(turn_vel_command)
         self.roll_motor.command_velocity(roll_vel_in_turns_s)
 
 # ========= Helper: Generate Wheel Geometry =========
@@ -214,6 +221,10 @@ class SwerveVehicle:
     wheel velocity is computed as:
          v_module = [vx, vy] + ω * [-y_effective, x_effective]
     where (x_effective,y_effective) = nominal_position + caster_offset_vector.
+    
+    Turning motors are now controlled in velocity mode. A position controller in the main
+    control loop computes a velocity command for each turning motor based on the error between
+    the desired turning angle and the actual turning angle from feedback.
     """
     def __init__(self, bus, feedback_collector, module_list, robot_size, num_wheels, caster_offset, nominal_wheel_positions=None):
         self.bus = bus
@@ -240,8 +251,6 @@ class SwerveVehicle:
             self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
         else:
             self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
-        # Store previous steering angle (in turns) for clamping
-        self.prev_angles = [0.0 for _ in range(len(self.modules))]
 
     def start(self):
         self.ctrl_thread.start()
@@ -262,7 +271,6 @@ class SwerveVehicle:
             except queue.Empty:
                 break
         self.cmd_queue.put({"type": "vel", "value": command})
-
 
     def control_loop(self):
         last_t = time.time()
@@ -293,19 +301,22 @@ class SwerveVehicle:
                 v_rot = omega * np.array([-effective_nominal[1], effective_nominal[0]])
                 v_total = np.array([vx, vy]) + v_rot
                 speed = np.linalg.norm(v_total)
-                angle = math.atan2(v_total[1], v_total[0])
-                angle_turns = angle / (2 * math.pi)
-                # Clamp maximum change in steering angle to ±0.2 turns per cycle
-                delta = angle_turns - self.prev_angles[i]
-                if delta > 0.2:
-                    logging.warning(f"Clamping module {i} positive delta from {delta:.3f} to 0.2")
-                    angle_turns = self.prev_angles[i] + 0.2
-                elif delta < -0.2:
-                    logging.warning(f"Clamping module {i} negative delta from {delta:.3f} to -0.2")
-                    angle_turns = self.prev_angles[i] - 0.2
-                self.prev_angles[i] = angle_turns
-                mod.command(angle_turns, speed)
-                logging.debug(f"Module {i}: steer={angle_turns:.3f} turns, speed={speed:.3f} turns/s")
+                desired_angle = math.atan2(v_total[1], v_total[0])
+                desired_angle_turns = desired_angle / (2 * math.pi)
+                
+                # Get current turning angle from feedback for this module's turning motor.
+                current_angle_turns, _ = self.feedback.feedback[mod.turn_motor.node_id]
+                # Compute the error, wrapping it to the range [-0.5, 0.5]
+                error = desired_angle_turns - current_angle_turns
+                error = (error + 0.5) % 1.0 - 0.5
+                # Compute turning velocity command using a proportional controller
+                turn_vel_command = KP_TURN * error
+                # Clamp the turning velocity command to ±MAX_TURN_VEL
+                turn_vel_command = max(min(turn_vel_command, MAX_TURN_VEL), -MAX_TURN_VEL)
+                
+                mod.command(turn_vel_command, speed)
+                logging.debug(f"Module {i}: desired angle={desired_angle_turns:.3f} turns, error={error:.3f}, "
+                              f"turn_vel_command={turn_vel_command:.3f} turns/s, roll speed={speed:.3f} turns/s")
     
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
@@ -321,7 +332,6 @@ def joystick_input_thread(vehicle, joystick):
         range_rx = 1.0
 
     # For D-pad translation, we expect discrete values on ABS_HAT0X and ABS_HAT0Y.
-    # Log their info if available.
     try:
         absinfo_hat0x = joystick.absinfo(ecodes.ABS_HAT0X)
         absinfo_hat0y = joystick.absinfo(ecodes.ABS_HAT0Y)
@@ -342,29 +352,23 @@ def joystick_input_thread(vehicle, joystick):
             elif event.code == ecodes.ABS_HAT0Y:
                 dpad_y = event.value  # Typically -1 (up) or 1 (down)
             elif event.code == ecodes.ABS_RX:
-                # Normalize the right stick's X axis.
                 norm_rx = (event.value - center_rx) / range_rx
                 if abs(norm_rx) < JOYSTICK_DEADZONE:
                     norm_rx = 0.0
                 rotation_val = norm_rx
 
-            # For translation, we map:
-            # - Up on the D-pad (usually reported as -1) to positive forward velocity.
-            # - Left/right are used directly.
-            target_vx = (-dpad_y) * JOYSTICK_SCALE_V
-            target_vy = dpad_x * JOYSTICK_SCALE_V
+            target_vx = (-dpad_y) * MAX_LINEAR_VEL
+            target_vy = dpad_x * MAX_LINEAR_VEL
             target_omega = rotation_val * JOYSTICK_SCALE_W
 
             vehicle.set_target_velocity([target_vx, target_vy, target_omega])
             time.sleep(0.005)
 
         elif event.type == ecodes.EV_KEY:
-            # When BTN_SOUTH is pressed, clear errors on all modules.
             if event.code == ecodes.BTN_SOUTH and event.value == 1:
                 logging.info("Clear errors button pressed; clearing errors on all modules.")
                 for mod in vehicle.modules:
                     mod.clear_errors()
-
 
 # ========= MAIN SCRIPT =========
 def main():
@@ -387,7 +391,7 @@ def main():
         offset = mcfg.get(str(nid), {}).get("offset", 0.0)
         flip   = mcfg.get(str(nid), {}).get("flip", 1.0)
         m = ODriveMotor(bus, nid, offset, flip, is_turning=False)
-        print(f' Motor {nid}: Flip = {flip}')
+        logging.info(f'Motor {nid}: Flip = {flip}')
         rolling_motors.append(m)
 
     modules = []
