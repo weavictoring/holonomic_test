@@ -24,7 +24,7 @@ import can, ruckig, numpy as np
 from evdev import InputDevice, categorize, ecodes, list_devices
 
 # ========= USER CONFIG =========
-CONTROL_FREQ = 250
+CONTROL_FREQ = 50
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ
 
 TURNING_NODE_IDS = [0, 2, 4]
@@ -323,7 +323,7 @@ def main():
         mcfg = json.load(f)
 
     # 2) Create CAN bus (adjust device name as needed)
-    bus = can.interface.Bus("can0", bustype="socketcan")
+    bus = can.interface.Bus("can0", interface="socketcan")
 
     # 3) Create ODriveMotor objects
     turning_motors = []
@@ -362,7 +362,7 @@ def main():
     devices = [InputDevice(path) for path in list_devices()]
     joystick = None
     for dev in devices:
-        if "Joystick" in dev.name or "Gamepad" in dev.name:
+        if "Wireless Controller" in dev.name:
             joystick = dev
             break
     if joystick is None:
@@ -371,9 +371,9 @@ def main():
     print(f"Joystick detected: {joystick.name}")
 
     # 8) Create the SwerveVehicle with desired geometry settings.
-    robot_size = 0.5    # Adjust as needed (units consistent with ODrive configuration)
+    robot_size = 0.350    # Adjust as needed (units consistent with ODrive configuration)
     num_wheels = 3
-    caster_offset = 0.1  # Adjust caster offset as needed
+    caster_offset = 0.015  # Adjust caster offset as needed
     vehicle = SwerveVehicle(bus, fb_collector, modules, robot_size, num_wheels, caster_offset)
     vehicle.start()
 
