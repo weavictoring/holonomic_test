@@ -12,6 +12,7 @@ This script:
   6) Commands turning motors with:  offset + flip * (desiredAngle in turns)
      and rolling motors with:   flip * desiredVelocity (in turns/s).
   7) Runs a control loop at ~250 Hz.
+  8) Logs real-time output and errors.
 
 Joystick input is read via the evdev library. The joystick’s ABS_Y axis (inverted so that 
 pushing forward gives positive velocity) is used for forward/backward command, and the 
@@ -20,12 +21,19 @@ ABS_X axis is used for turning command. Lateral (vy) is set to 0 here but could 
 Test carefully at low current & speed with the robot wheels off the ground!
 """
 
-import os, sys, math, json, time, queue, struct, threading
+import os, sys, math, json, time, queue, struct, threading, logging
 import can, ruckig, numpy as np
 from evdev import InputDevice, categorize, ecodes, list_devices
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+
 # ========= USER CONFIG =========
-CONTROL_FREQ = 50
+CONTROL_FREQ = 250
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ
 
 TURNING_NODE_IDS = [0, 2, 4]
@@ -35,13 +43,13 @@ ALL_NODE_IDS = TURNING_NODE_IDS + ROLLING_NODE_IDS
 CURRENT_LIMIT_ROLLING = 5.0    # 5 A current limit for rolling motors
 VEL_LIMIT_ROLLING = 2          # Example velocity limit in turns/s
 
-MAX_LINEAR_VEL = 1.0   # Maximum forward velocity (in turns/s, or your chosen unit)
-MAX_ANG_VEL    = 3     # Maximum angular velocity (in turns/s for turning)
+MAX_LINEAR_VEL = 1.0   # Maximum forward velocity (in turns/s)
+MAX_ANG_VEL    = 3     # Maximum angular velocity (in turns/s)
 
 # Joystick parameters
 JOYSTICK_DEADZONE = 0.1
-JOYSTICK_SCALE_V = MAX_LINEAR_VEL  # Scale normalized joystick value to velocity
-JOYSTICK_SCALE_W = MAX_ANG_VEL     # Scale normalized joystick value to rotational velocity
+JOYSTICK_SCALE_V = MAX_LINEAR_VEL  
+JOYSTICK_SCALE_W = MAX_ANG_VEL     
 
 MOTOR_CONFIG_FILE = "motor_config.json"
 
@@ -81,11 +89,10 @@ def set_input_pos(bus, node_id, pos):
     arbid = to_arbid(node_id, FUNC_SET_INPUT_POS)
     data = struct.pack('<fhh', pos, 0, 0)
     msg = can.Message(arbitration_id=arbid, data=data, is_extended_id=False)
-    # Catch transmit errors to avoid crashing if the buffer is full.
     try:
         bus.send(msg)
     except can.CanOperationError as e:
-        print(f"Warning: Could not send position command for node {node_id}: {e}")
+        logging.error(f"CAN send error (position) for node {node_id}: {e}")
 
 def set_input_vel(bus, node_id, vel):
     arbid = to_arbid(node_id, FUNC_SET_INPUT_VEL)
@@ -94,7 +101,7 @@ def set_input_vel(bus, node_id, vel):
     try:
         bus.send(msg)
     except can.CanOperationError as e:
-        print(f"Warning: Could not send velocity command for node {node_id}: {e}")
+        logging.error(f"CAN send error (velocity) for node {node_id}: {e}")
 
 # ========= BACKGROUND FEEDBACK THREAD =========
 class ODriveFeedbackCollector(threading.Thread):
@@ -143,9 +150,11 @@ class ODriveMotor:
         set_limits(self.bus, self.node_id, vel_lim, curr_lim)
 
     def command_position(self, raw_angle):
+        logging.debug(f"Node {self.node_id} position command: {raw_angle:.3f} turns")
         set_input_pos(self.bus, self.node_id, raw_angle)
 
     def command_velocity(self, raw_vel):
+        logging.debug(f"Node {self.node_id} velocity command: {raw_vel:.3f} turns/s")
         set_input_vel(self.bus, self.node_id, raw_vel)
 
 class SwerveModule:
@@ -172,10 +181,10 @@ class SwerveModule:
         self.turn_motor.command_position(steer_angle_in_turns)
         self.roll_motor.command_velocity(roll_vel_in_turns_s)
 
-# ========= Helper: Generate or Load Wheel Geometry =========
+# ========= Helper: Generate Wheel Geometry =========
 def generate_wheel_positions(num_wheels, robot_size):
     if num_wheels == 3:
-        # Default: arrange 3 wheels in an equilateral triangle.
+        # Arrange 3 wheels in an equilateral triangle.
         R = robot_size / 2  # radius of circumscribed circle
         positions = []
         for i in range(3):
@@ -235,7 +244,7 @@ class SwerveVehicle:
             self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
         else:
             self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
-        # Store previous steering angle (in turns) for each module to limit the change.
+        # Store previous steering angle (in turns) for clamping
         self.prev_angles = [0.0 for _ in range(len(self.modules))]
 
     def start(self):
@@ -253,7 +262,7 @@ class SwerveVehicle:
         try:
             self.cmd_queue.put({"type": "vel", "value": command}, block=False)
         except queue.Full:
-            print("Warning: command queue full.")
+            logging.warning("Command queue full.")
 
     def control_loop(self):
         last_t = time.time()
@@ -268,10 +277,12 @@ class SwerveVehicle:
                 cmd = self.cmd_queue.get_nowait()
                 if cmd["type"] == "vel":
                     self.inp.target_velocity = cmd["value"]
+                    logging.debug(f"New target velocity: {self.inp.target_velocity}")
 
             self.rk.update(self.inp, self.out)
             self.out.pass_to_input(self.inp)
             vx, vy, omega = self.out.new_velocity
+            logging.debug(f"Smoothed velocity: vx={vx:.3f}, vy={vy:.3f}, ω={omega:.3f}")
 
             # For each module, compute the effective command.
             for i, mod in enumerate(self.modules):
@@ -284,16 +295,18 @@ class SwerveVehicle:
                 speed = np.linalg.norm(v_total)
                 angle = math.atan2(v_total[1], v_total[0])
                 angle_turns = angle / (2 * math.pi)
-                # Clamp the change in angle: limit delta to ±0.2 turns
+                # Clamp maximum change in steering angle to ±0.2 turns per cycle
                 delta = angle_turns - self.prev_angles[i]
                 if delta > 0.2:
+                    logging.warning(f"Clamping module {i} positive delta from {delta:.3f} to 0.2")
                     angle_turns = self.prev_angles[i] + 0.2
                 elif delta < -0.2:
+                    logging.warning(f"Clamping module {i} negative delta from {delta:.3f} to -0.2")
                     angle_turns = self.prev_angles[i] - 0.2
                 self.prev_angles[i] = angle_turns
                 mod.command(angle_turns, speed)
-
-
+                logging.debug(f"Module {i}: steer={angle_turns:.3f} turns, speed={speed:.3f} turns/s")
+    
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
     absinfo_y = joystick.absinfo(ecodes.ABS_Y)
@@ -302,8 +315,8 @@ def joystick_input_thread(vehicle, joystick):
     range_y = (absinfo_y.max - center_y)
     center_x = (absinfo_x.min + absinfo_x.max) / 2
     range_x = (absinfo_x.max - center_x)
-    print(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}, center={center_y}")
-    print(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}, center={center_x}")
+    logging.info(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}, center={center_y}")
+    logging.info(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}, center={center_x}")
 
     norm_y = 0.0
     norm_x = 0.0
@@ -312,7 +325,7 @@ def joystick_input_thread(vehicle, joystick):
         if event.type == ecodes.EV_ABS:
             if event.code == ecodes.ABS_Y:
                 val_y = event.value
-                norm_y = (center_y - val_y) / range_y  # invert: lower value means forward
+                norm_y = (center_y - val_y) / range_y  # Invert: lower value means forward
                 norm_y = norm_y if abs(norm_y) > JOYSTICK_DEADZONE else 0.0
             elif event.code == ecodes.ABS_X:
                 val_x = event.value
@@ -328,7 +341,7 @@ def joystick_input_thread(vehicle, joystick):
 # ========= MAIN SCRIPT =========
 def main():
     if not os.path.exists(MOTOR_CONFIG_FILE):
-        print(f"Error: missing {MOTOR_CONFIG_FILE}. Please create it.")
+        logging.error(f"Missing {MOTOR_CONFIG_FILE}. Please create it.")
         sys.exit(1)
     with open(MOTOR_CONFIG_FILE, 'r') as f:
         mcfg = json.load(f)
@@ -363,7 +376,6 @@ def main():
 
     fb_collector = ODriveFeedbackCollector(bus)
 
-    # Use evdev to detect a Bluetooth joystick.
     from evdev import list_devices, InputDevice
     devices = [InputDevice(path) for path in list_devices()]
     joystick = None
@@ -372,22 +384,21 @@ def main():
             joystick = dev
             break
     if joystick is None:
-        print("No joystick detected! Exiting.")
+        logging.error("No joystick detected! Exiting.")
         sys.exit(1)
-    print(f"Joystick detected: {joystick.name}")
+    logging.info(f"Joystick detected: {joystick.name}")
     absinfo_y = joystick.absinfo(ecodes.ABS_Y)
     absinfo_x = joystick.absinfo(ecodes.ABS_X)
-    print(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}")
-    print(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}")
+    logging.info(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}")
+    logging.info(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}")
 
     robot_size = 0.350   # Adjust as needed
     num_wheels = 3
     caster_offset = 0.015  # Adjust as needed
 
-    # Check if motor_config.json includes a global "wheel_positions" entry.
     if "wheel_positions" in mcfg:
         nominal_wheel_positions = [np.array(pos) for pos in mcfg["wheel_positions"]]
-        print("Using configured wheel positions from motor_config.json")
+        logging.info("Using configured wheel positions from motor_config.json")
     else:
         nominal_wheel_positions = None
 
@@ -398,14 +409,14 @@ def main():
     js_thread.start()
 
     try:
-        print("Control loop started. Use your joystick to drive the robot.")
+        logging.info("Control loop started. Use your joystick to drive the robot.")
         while True:
             time.sleep(0.1)
     except KeyboardInterrupt:
-        print("CTRL+C detected, stopping vehicle.")
+        logging.info("CTRL+C detected, stopping vehicle.")
     finally:
         vehicle.stop()
-        print("All done.")
+        logging.info("All done.")
 
 if __name__ == "__main__":
     main()
