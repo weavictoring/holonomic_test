@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 3-Wheel Holonomic Base with Powered Caster Drive Using Joystick Control (via evdev)
 
