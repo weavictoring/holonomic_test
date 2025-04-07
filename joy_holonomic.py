@@ -306,9 +306,10 @@ class SwerveVehicle:
                 
                 # Get current turning angle from feedback for this module's turning motor.
                 current_angle_turns, _ = self.feedback.feedback[mod.turn_motor.node_id]
-                # Compute the error, wrapping it to the range [-0.5, 0.5]
-                error = desired_angle_turns - current_angle_turns
-                error = (error + 0.5) % 1.0 - 0.5
+                # Compute error using a modulo approach so that we choose the positive rotation
+                error = (desired_angle_turns - current_angle_turns) % 1.0
+                if error > 0.5:
+                    error -= 1.0
                 # Compute turning velocity command using a proportional controller
                 turn_vel_command = KP_TURN * error
                 # Clamp the turning velocity command to ±MAX_TURN_VEL
