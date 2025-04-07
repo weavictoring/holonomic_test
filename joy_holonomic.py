@@ -276,14 +276,7 @@ class SwerveVehicle:
     
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
-    """
-    Reads joystick events from evdev and computes normalized target commands.
-    We assume:
-      - ABS_Y (typically axis 1) for forward/backward (inverted: lower value = forward)
-      - ABS_X (typically axis 0) for turning
-    Lateral (vy) is set to zero in this demo.
-    """
-    # Get calibration info for ABS_Y and ABS_X
+    # Get calibration info...
     absinfo_y = joystick.absinfo(ecodes.ABS_Y)
     absinfo_x = joystick.absinfo(ecodes.ABS_X)
     center_y = (absinfo_y.min + absinfo_y.max) / 2
@@ -293,25 +286,27 @@ def joystick_input_thread(vehicle, joystick):
     print(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}, center={center_y}")
     print(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}, center={center_x}")
 
-    while vehicle.run_flag:
-        for event in joystick.read_loop():
-            if event.type == ecodes.EV_ABS:
-                if event.code == ecodes.ABS_Y:
-                    val_y = event.value
-                    norm_y = (center_y - val_y) / range_y  # Invert: lower than center means positive forward
-                    # Apply deadzone
-                    norm_y = norm_y if abs(norm_y) > JOYSTICK_DEADZONE else 0.0
-                elif event.code == ecodes.ABS_X:
-                    val_x = event.value
-                    norm_x = (val_x - center_x) / range_x
-                    norm_x = norm_x if abs(norm_x) > JOYSTICK_DEADZONE else 0.0
-                # We assume lateral (ABS_?) is not used, so set it to 0.
-                target_vx = norm_y * JOYSTICK_SCALE_V
-                target_vy = 0.0
-                target_omega = norm_x * JOYSTICK_SCALE_W
-                vehicle.set_target_velocity([target_vx, target_vy, target_omega])
-                # Small sleep to avoid saturating the command queue.
-                time.sleep(0.005)
+    # Initialize defaults
+    norm_y = 0.0
+    norm_x = 0.0
+
+    for event in joystick.read_loop():
+        if event.type == ecodes.EV_ABS:
+            if event.code == ecodes.ABS_Y:
+                val_y = event.value
+                norm_y = (center_y - val_y) / range_y  # invert for forward positive
+                norm_y = norm_y if abs(norm_y) > JOYSTICK_DEADZONE else 0.0
+            elif event.code == ecodes.ABS_X:
+                val_x = event.value
+                norm_x = (val_x - center_x) / range_x
+                norm_x = norm_x if abs(norm_x) > JOYSTICK_DEADZONE else 0.0
+
+            target_vx = norm_y * JOYSTICK_SCALE_V
+            target_vy = 0.0  # not used in this demo
+            target_omega = norm_x * JOYSTICK_SCALE_W
+            vehicle.set_target_velocity([target_vx, target_vy, target_omega])
+            time.sleep(0.005)
+
 
 # ========= MAIN SCRIPT =========
 def main():
