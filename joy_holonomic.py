@@ -234,8 +234,9 @@ class SwerveVehicle:
         if nominal_wheel_positions is None:
             self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
         else:
-            # Use the user-provided configuration
             self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
+        # Store previous steering angle (in turns) for each module to limit the change.
+        self.prev_angles = [0.0 for _ in range(len(self.modules))]
 
     def start(self):
         self.ctrl_thread.start()
@@ -283,7 +284,15 @@ class SwerveVehicle:
                 speed = np.linalg.norm(v_total)
                 angle = math.atan2(v_total[1], v_total[0])
                 angle_turns = angle / (2 * math.pi)
+                # Clamp the change in angle: limit delta to ±0.2 turns
+                delta = angle_turns - self.prev_angles[i]
+                if delta > 0.2:
+                    angle_turns = self.prev_angles[i] + 0.2
+                elif delta < -0.2:
+                    angle_turns = self.prev_angles[i] - 0.2
+                self.prev_angles[i] = angle_turns
                 mod.command(angle_turns, speed)
+
 
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
