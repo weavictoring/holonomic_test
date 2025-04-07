@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 3-Wheel Holonomic Base with Powered Caster Drive Using Joystick Control (via evdev)
- 
+
 This script:
   1) Loads motor_config.json for each ODrive node (including flip, offset, and optionally wheel_positions).
   2) Spawns a background thread to parse ODrive encoder feedback.
@@ -11,8 +11,7 @@ This script:
        - Translation: from the left joystick (x,y plane)
        - Rotation: from the right joystick (rotation about z)
      A caster offset is factored in for each wheel.
-  6) Uses a proportional controller for the turning motors—here the inverse-kinematics calculations are done 
-     via matrices (vectorized computation) instead of a loop.
+  6) For turning, the motor is operated in position mode so that the target turning angle is sent directly.
   7) Logs live status: for each module the desired (turn) angle, the real-time encoder angle (with offset applied),
      and the rolling command.
   8) Runs the control loop at ~50 Hz.
@@ -32,7 +31,7 @@ logging.basicConfig(
 )
 
 # ------------------ USER CONFIG ------------------
-CONTROL_FREQ = 50                         # Control loop frequency (Hz)
+CONTROL_FREQ = 20                         # Control loop frequency (Hz)
 CONTROL_PERIOD = 1.0 / CONTROL_FREQ         # Control loop period (s)
 
 # ODrive node IDs for turning and rolling motors.
@@ -45,10 +44,6 @@ VEL_LIMIT_ROLLING = 2          # Rolling motor velocity limit (turns/s)
 
 MAX_LINEAR_VEL = 1.0         # Maximum translational speed (turns/s equivalent)
 MAX_ANG_VEL    = 3           # Maximum rotational speed (turns/s)
-
-# Parameters for turning (angle) controller (velocity mode)
-KP_TURN = 2.0                # Proportional gain for turning angle error
-MAX_TURN_VEL = 1.0           # Maximum turning wheel velocity (turns/s)
 
 # Joystick parameters
 JOYSTICK_DEADZONE = 0.1  
@@ -161,6 +156,7 @@ class ODriveMotor:
         set_input_pos(self.bus, self.node_id, computed_angle)
     
     def command_velocity(self, raw_vel):
+        # For rolling motors, add the offset in position mode.
         computed_vel = (self.flip * raw_vel) if self.is_turning else (self.offset + self.flip * raw_vel)
         set_input_vel(self.bus, self.node_id, computed_vel)
         logging.debug(f"Node {self.node_id} velocity command: {computed_vel:.3f} turns/s")
@@ -168,8 +164,8 @@ class ODriveMotor:
 class SwerveModule:
     """
     Combines one turning and one rolling motor.
-    The turning motor is driven via a P controller (velocity mode) toward a desired angle.
-    The rolling motor is commanded directly with a speed.
+    For turning, the motor is in position mode so the desired turning angle is sent directly.
+    The rolling motor is commanded with a speed.
     """
     def __init__(self, turn_motor, roll_motor):
         self.turn_motor = turn_motor
@@ -192,10 +188,12 @@ class SwerveModule:
     def set_rolling_limits(self, vel_limit, curr_limit):
         self.roll_motor.set_limits(vel_limit, curr_limit)
     
-    def command(self, turn_vel_command, roll_vel, desired_turn_angle):
-        # Save the desired turn angle (0 to 1) and roll command for logging.
+    def command(self, desired_turn_angle, roll_vel):
+        # Save desired values for logging.
         self.last_command = (desired_turn_angle, roll_vel)
-        self.turn_motor.command_velocity(turn_vel_command)
+        # Send direct position command to turning motor.
+        self.turn_motor.command_position(desired_turn_angle)
+        # Send rolling velocity command to rolling motor.
         self.roll_motor.command_velocity(roll_vel)
 
 # ------------------ HELPER: WHEEL GEOMETRY ------------------
@@ -221,17 +219,14 @@ class SwerveVehicle:
     The target velocity is a 3-element vector: [vx, vy, ω] (from joysticks).
     
     For each module:
-      - The translational velocity [vx,vy] is combined with the rotational contribution:
+      - The translational velocity [vx, vy] is combined with the rotational contribution:
             v_rot = ω * [-y_effective, x_effective]
         where effective position = nominal position + caster_offset vector.
       - The total wheel velocity vector is computed for all modules in a matrix operation.
       - The desired turning angle is derived via arctan2 and mapped to [0,1) turns.
-      - The current turning feedback (with motor offset added) is also wrapped to [0,1).
-      - The error (smallest angular difference) is computed vectorized, and the P controller
-        outputs a turning velocity command.
-      - Commands are then sent to each module individually.
-    
-    Live logging outputs the desired turning angle and the real-time (offset-applied) encoder angle.
+      - The rolling speed is computed as the norm of the total velocity vector.
+      - For turning, the desired turning angle is sent directly (position mode) to the motor.
+      - For rolling, the velocity command is sent as before.
     """
     def __init__(self, bus, feedback_collector, module_list, robot_size, num_wheels, caster_offset, nominal_wheel_positions=None):
         self.bus = bus
@@ -249,6 +244,19 @@ class SwerveVehicle:
             self.nominal_wheel_positions = generate_wheel_positions(num_wheels, robot_size)
         else:
             self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
+
+        # --------------------------------------------------------------------
+        # Precompute effective nominal wheel positions (matrix version)
+        # This adds the caster offset along the direction of each nominal wheel position.
+        P = np.stack(self.nominal_wheel_positions)  # shape (n,2)
+        norms = np.linalg.norm(P, axis=1)
+        self.effective_nominal = np.empty_like(P)
+        for i in range(num_wheels):
+            if norms[i] != 0:
+                self.effective_nominal[i, :] = P[i, :] + (P[i, :] / norms[i]) * self.caster_offset
+            else:
+                self.effective_nominal[i, :] = P[i, :]
+        # --------------------------------------------------------------------
     
     def start(self):
         self.ctrl_thread.start()
@@ -265,32 +273,35 @@ class SwerveVehicle:
     def set_target_velocity(self, command):
         """Update target velocity command: [vx, vy, ω]."""
         self.target_velocity = command
+
+    def compute_wheel_velocities(self, vx, vy, omega):
+        """
+        Compute the wheel velocity vectors for each module using matrix operations.
+          - v_rot = omega * [-y_effective, x_effective] (for each wheel)
+          - v_total = [vx, vy] + v_rot
+        Returns:
+          - v_total: matrix of shape (num_wheels, 2)
+        """
+        num = self.num_wheels
+        v_trans = np.array([vx, vy])
+        v_trans_tile = np.tile(v_trans, (num, 1))
+        # Use the precomputed effective_nominal positions
+        v_rot = omega * np.column_stack((-self.effective_nominal[:, 1], self.effective_nominal[:, 0]))
+        v_total = v_trans_tile + v_rot
+        return v_total
     
     def control_loop(self):
         """
         Runs at CONTROL_FREQ Hz.
         Uses matrix operations to compute:
-          - effective nominal positions for all modules (with caster offset)
-          - the rotational contribution v_rot for each module
-          - the total wheel velocity vectors (v_total) for all modules
-          - desired turning angles from v_total (mapped to [0, 1))
-          - retrieves current turning angles (with motor offset added) into an array
-          - computes the error vector and outputs turning velocity commands
+          - the total wheel velocity vectors (from translation + rotation)
+          - desired turning angles (mapped to [0, 1) turns)
+          - rolling speeds (as norms of the wheel velocity vectors)
+        For turning, the desired turning angles are sent directly using position mode.
         """
         last_t = time.time()
         num = self.num_wheels
-        # Precompute nominal positions matrix of shape (n, 2)
-        P = np.stack(self.nominal_wheel_positions)  # shape (n,2)
-        # Compute module norms
-        norms = np.linalg.norm(P, axis=1)
-        # Avoid division by zero: if norm is zero, just leave as zero.
-        effective_nominal = np.empty_like(P)
-        for i in range(num):
-            if norms[i] != 0:
-                effective_nominal[i,:] = P[i,:] + (P[i,:] / norms[i]) * self.caster_offset
-            else:
-                effective_nominal[i,:] = P[i,:]
-    
+        
         while self.run_flag:
             now = time.time()
             dt = now - last_t
@@ -301,38 +312,19 @@ class SwerveVehicle:
             vx, vy, omega = self.target_velocity
             logging.debug(f"Target velocity: vx={vx:.3f}, vy={vy:.3f}, ω={omega:.3f}")
             
-            # Compute rotational contribution for all modules: for each module [ -effective_y, effective_x ]
-            v_rot = omega * np.column_stack((-effective_nominal[:,1], effective_nominal[:,0]))
-            # Total wheel velocity vector for each module: v_total = [vx,vy] + v_rot
-            v_total = np.tile(np.array([vx, vy]), (num,1)) + v_rot
-            # Rolling speed for each module is the norm of its v_total vector
+            # Compute total wheel velocity vector using the helper function.
+            v_total = self.compute_wheel_velocities(vx, vy, omega)
+            # Rolling speed: the norm of each wheel's velocity vector.
             roll_speed = np.linalg.norm(v_total, axis=1)
-            # Desired turning angle (radians) for each module via arctan2, then map to turns in [0,1)
-            desired_angle = np.arctan2(v_total[:,1], v_total[:,0])
+            # Desired turning angle (in radians) for each wheel using arctan2.
+            desired_angle = np.arctan2(v_total[:, 1], v_total[:, 0])
+            # Map to turns in [0, 1)
             desired_angle_turns = (desired_angle / (2 * math.pi)) % 1.0
-
-            # Retrieve current turning angles from feedback (with motor offset applied)
-            current_angles = []
-            offsets = []
-            for mod in self.modules:
-                cur, _ = self.feedback.feedback.get(mod.turn_motor.node_id, (0.0,0.0))
-                current_angles.append(cur)
-                offsets.append(mod.turn_motor.offset)
-            current_angles = np.array(current_angles) % 1.0
-            offsets = np.array(offsets) % 1.0
-            # Effective current turning angles as seen by the motor:
-            effective_current = (current_angles + offsets) % 1.0
             
-            # Compute angle error vector (smallest angular difference)
-            error = (desired_angle_turns - effective_current) % 1.0
-            error = np.where(error > 0.5, error - 1.0, error)
-            # Compute turning velocity commands via P controller and clamp them.
-            turn_vel_command = np.clip(KP_TURN * error, -MAX_TURN_VEL, MAX_TURN_VEL)
-            
-            # Send commands to each module.
+            # Directly send the desired turning angles and rolling speeds.
             for i, mod in enumerate(self.modules):
-                mod.command(turn_vel_command[i], roll_speed[i], desired_angle_turns[i])
-            logging.debug(f"Matrix Computation: desired angles={desired_angle_turns}, effective current={effective_current}, error={error}")
+                mod.command(desired_angle_turns[i], roll_speed[i])
+            logging.debug(f"Matrix Computation: desired angles={desired_angle_turns}, roll speeds={roll_speed}")
     
     def log_status(self):
         """
