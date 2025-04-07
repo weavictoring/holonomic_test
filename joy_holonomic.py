@@ -156,7 +156,8 @@ class ODriveMotor:
 
     def command_velocity(self, raw_vel):
         logging.debug(f"Node {self.node_id} velocity command: {raw_vel:.3f} turns/s")
-        set_input_vel(self.bus, self.node_id, raw_vel)
+        computed_vel = self.offset + self.flip * raw_vel
+        set_input_vel(self.bus, self.node_id, computed_vel)
 
 class SwerveModule:
     def __init__(self, turn_motor, roll_motor):
