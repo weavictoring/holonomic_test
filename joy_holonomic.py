@@ -151,7 +151,8 @@ class ODriveMotor:
 
     def command_position(self, raw_angle):
         logging.debug(f"Node {self.node_id} position command: {raw_angle:.3f} turns")
-        set_input_pos(self.bus, self.node_id, raw_angle)
+        computed_angle = self.offset + self.flip * raw_angle
+        set_input_pos(self.bus, self.node_id, computed_angle)
 
     def command_velocity(self, raw_vel):
         logging.debug(f"Node {self.node_id} velocity command: {raw_vel:.3f} turns/s")
