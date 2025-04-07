@@ -309,42 +309,51 @@ class SwerveVehicle:
     
 # ========= JOYSTICK INPUT THREAD (using evdev) =========
 def joystick_input_thread(vehicle, joystick):
-    absinfo_y = joystick.absinfo(ecodes.ABS_Y)
-    absinfo_x = joystick.absinfo(ecodes.ABS_X)
-    center_y = (absinfo_y.min + absinfo_y.max) / 2
-    range_y = (absinfo_y.max - center_y)
-    center_x = (absinfo_x.min + absinfo_x.max) / 2
-    range_x = (absinfo_x.max - center_x)
-    logging.info(f"Joystick ABS_Y: min={absinfo_y.min}, max={absinfo_y.max}, center={center_y}")
-    logging.info(f"Joystick ABS_X: min={absinfo_x.min}, max={absinfo_x.max}, center={center_x}")
+    """
+    Joystick thread that polls button states instead of analog axes.
+    Button mapping:
+      - BTN_SOUTH: forward (vx = +MAX_LINEAR_VEL)
+      - BTN_NORTH: backward (vx = -MAX_LINEAR_VEL)
+      - BTN_TR: rotate right (ω = +MAX_ANG_VEL)
+      - BTN_TL: rotate left (ω = -MAX_ANG_VEL)
+      - BTN_SELECT: clear errors (edge-triggered)
+    """
+    logging.info(f"Joystick detected: {joystick.name}")
+    prev_clear_error_state = False  # For edge detection on clear errors button
 
-    norm_y = 0.0
-    norm_x = 0.0
-
-    for event in joystick.read_loop():
-        if event.type == ecodes.EV_ABS:
-            if event.code == ecodes.ABS_Y:
-                val_y = event.value
-                norm_y = (center_y - val_y) / range_y  # Invert: lower value means forward
-                norm_y = norm_y if abs(norm_y) > JOYSTICK_DEADZONE else 0.0
-            elif event.code == ecodes.ABS_X:
-                val_x = event.value
-                norm_x = (val_x - center_x) / range_x
-                norm_x = norm_x if abs(norm_x) > JOYSTICK_DEADZONE else 0.0
-
-            target_vx = norm_y * JOYSTICK_SCALE_V
-            target_vy = 0.0  # Lateral not used in this demo
-            target_omega = norm_x * JOYSTICK_SCALE_W
-            vehicle.set_target_velocity([target_vx, target_vy, target_omega])
-            time.sleep(0.005)
+    while True:
+        # Get the set of currently pressed button codes.
+        active = joystick.active_keys()  # Returns a tuple of key codes that are pressed.
         
-        # Check for button press events
-        elif event.type == ecodes.EV_KEY:
-            # When BTN_SOUTH is pressed (value==1), clear errors on all modules.
-            if event.code == ecodes.BTN_SOUTH and event.value == 1:
-                logging.info("Clear errors button pressed; clearing errors on all modules.")
-                for mod in vehicle.modules:
-                    mod.clear_errors()
+        # Initialize command velocities
+        vx = 0.0
+        omega = 0.0
+        # vy remains 0 in this mapping
+        
+        # Map buttons to velocity commands:
+        if ecodes.BTN_SOUTH in active:
+            vx += MAX_LINEAR_VEL
+        if ecodes.BTN_NORTH in active:
+            vx -= MAX_LINEAR_VEL
+        
+        if ecodes.BTN_TR in active:
+            omega += MAX_ANG_VEL
+        if ecodes.BTN_TL in active:
+            omega -= MAX_ANG_VEL
+
+        # Set the target velocity command for the vehicle.
+        vehicle.set_target_velocity([vx, 0.0, omega])
+        
+        # Clear errors on edge trigger for BTN_SELECT.
+        clear_error_now = ecodes.BTN_SELECT in active
+        if clear_error_now and not prev_clear_error_state:
+            logging.info("Clear errors button pressed; clearing errors on all modules.")
+            for mod in vehicle.modules:
+                mod.clear_errors()
+        prev_clear_error_state = clear_error_now
+        
+        time.sleep(0.05)  # Update at 20 Hz (adjust as needed)
+
 
 # ========= MAIN SCRIPT =========
 def main():
