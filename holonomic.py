@@ -266,7 +266,7 @@ class SwerveVehicle:
 
     def control_loop(self):
         """
-        ~250 Hz. 
+        ~50 Hz. 
         Example approach:
           - read Ruckig output => final velocity
           - compute each module's turning angle & wheel velocity

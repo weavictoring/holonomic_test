@@ -11,7 +11,7 @@ This script:
      smoothed joystick commands, factoring in a caster offset.
   6) Commands turning motors with:  offset + flip * (desiredAngle in turns)
      and rolling motors with:   flip * desiredVelocity (in turns/s).
-  7) Runs a control loop at ~250 Hz.
+  7) Runs a control loop at ~50 Hz.
   8) Logs real-time output and errors.
 
 Joystick input is read via the evdev library. The joystick’s ABS_Y axis (inverted so that 
@@ -254,10 +254,14 @@ class SwerveVehicle:
 
     def set_target_velocity(self, command):
         """Command is a list: [vx, vy, ω]."""
-        try:
-            self.cmd_queue.put({"type": "vel", "value": command}, block=False)
-        except queue.Full:
-            logging.warning("Command queue full.")
+        # Flush any pending command so we always process the latest command
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.cmd_queue.put({"type": "vel", "value": command})
+
 
     def control_loop(self):
         last_t = time.time()
@@ -332,6 +336,14 @@ def joystick_input_thread(vehicle, joystick):
             target_omega = norm_x * JOYSTICK_SCALE_W
             vehicle.set_target_velocity([target_vx, target_vy, target_omega])
             time.sleep(0.005)
+        
+        # Check for button press events
+        elif event.type == ecodes.EV_KEY:
+            # When BTN_SOUTH is pressed (value==1), clear errors on all modules.
+            if event.code == ecodes.BTN_SOUTH and event.value == 1:
+                logging.info("Clear errors button pressed; clearing errors on all modules.")
+                for mod in vehicle.modules:
+                    mod.clear_errors()
 
 # ========= MAIN SCRIPT =========
 def main():
@@ -354,6 +366,7 @@ def main():
         offset = mcfg.get(str(nid), {}).get("offset", 0.0)
         flip   = mcfg.get(str(nid), {}).get("flip", 1.0)
         m = ODriveMotor(bus, nid, offset, flip, is_turning=False)
+        print(f' Motor {nid}: Flip = {flip}')
         rolling_motors.append(m)
 
     modules = []
