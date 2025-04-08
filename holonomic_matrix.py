@@ -355,54 +355,55 @@ def visualization_loop(vehicle):
       - The robot's current estimated position (integrated)
       - The robot's outline (based on nominal wheel positions)
       - The target translational velocity vector (drawn as an arrow)
-      - Each module's effective wheel position and its directional (turning) vector
+      - Each module's effective wheel position and its directional (turning) vector.
     This image is saved periodically to 'robot_state.png'.
     """
     import matplotlib
     matplotlib.use('Agg')  # Headless backend
     import matplotlib.pyplot as plt
 
-    last_time = time.time()
     while vehicle.run_flag:
-        now = time.time()
-        dt = now - last_time
-        last_time = now
-
-        # Start plotting.
-        fig, ax = plt.subplots(figsize=(6,6))
-        ax.set_title("Robot State and Command Vectors")
-        ax.set_xlim(-1, 1)
-        ax.set_ylim(-1, 1)
-        ax.set_aspect('equal')
+        # Create a new figure each cycle.
+        fig, ax = plt.subplots(figsize=(6, 6))
         
-        # Draw robot outline based on nominal positions (shifted by robot_position)
+        # Use dynamic limits centered around the robot's current position.
+        center = vehicle.robot_position
+        span = 0.5  # Adjust span as needed for a good view.
+        ax.set_xlim(center[0] - span, center[0] + span)
+        ax.set_ylim(center[1] - span, center[1] + span)
+        ax.set_aspect('equal')
+        ax.set_title("Robot State and Command Vectors")
+        
+        # Draw robot outline based on nominal positions (shifted by robot_position).
         nominal = np.stack(vehicle.nominal_wheel_positions)
         nominal_shifted = nominal + vehicle.robot_position
-        polygon = np.vstack((nominal_shifted, nominal_shifted[0]))  # close the loop
-        ax.plot(polygon[:,0], polygon[:,1], 'k-', linewidth=2, label="Robot Outline")
+        # Close the polygon by connecting last point to the first.
+        polygon = np.vstack((nominal_shifted, nominal_shifted[0]))
+        ax.plot(polygon[:, 0], polygon[:, 1], 'k-', linewidth=2, label="Robot Outline")
         
-        # Mark robot center.
-        ax.plot(vehicle.robot_position[0], vehicle.robot_position[1], 'ro', label="Robot Center")
+        # Mark the robot center.
+        ax.plot(vehicle.robot_position[0], vehicle.robot_position[1], 'ro',
+                markersize=8, label="Robot Center")
         
         # Draw target translational velocity vector (scaled for visualization).
         vx, vy, _ = vehicle.target_velocity
-        scale = 0.2  # adjust scale factor as needed
+        scale = 0.2
         ax.arrow(vehicle.robot_position[0], vehicle.robot_position[1],
-                 vx*scale, vy*scale, head_width=0.02, head_length=0.03,
+                 vx * scale, vy * scale, head_width=0.02, head_length=0.03,
                  fc='g', ec='g', label="Translational cmd")
         
         # Draw each module's effective wheel position and its directional arrow.
         for i, mod in enumerate(vehicle.modules):
-            # Effective wheel position (from precomputed matrix, shifted by robot position)
+            # The effective position is computed in the SwerveVehicle constructor.
             pos = vehicle.effective_nominal[i] + vehicle.robot_position
-            # Get desired turning angle from last command and convert turns to radians.
+            # Retrieve the desired turning angle (in [0,1) turns) and rolling speed.
             desired_turn_angle_turns, roll_speed = mod.last_command
-            desired_turn_angle_rad = desired_turn_angle_turns * 2*math.pi
-            # Scale arrow length by roll speed.
-            arrow_length = roll_speed * 0.2
+            desired_turn_angle_rad = desired_turn_angle_turns * 2 * math.pi
+            # Scale the arrow length by rolling speed.
+            arrow_length = roll_speed * 0.1  # Adjust this scale factor if needed.
             dx = math.cos(desired_turn_angle_rad) * arrow_length
             dy = math.sin(desired_turn_angle_rad) * arrow_length
-            ax.plot(pos[0], pos[1], 'bo')  # wheel marker
+            ax.plot(pos[0], pos[1], 'bo', markersize=6)  # Mark wheel position.
             ax.arrow(pos[0], pos[1], dx, dy, head_width=0.01, head_length=0.015,
                      fc='b', ec='b')
             ax.text(pos[0], pos[1], f"{i}", color="b")
@@ -411,6 +412,7 @@ def visualization_loop(vehicle):
         plt.savefig("robot_state.png")
         plt.close(fig)
         time.sleep(1.0)
+
 
 # ------------------ JOYSTICK INPUT THREAD ------------------
 def joystick_input_thread(vehicle, joystick):
