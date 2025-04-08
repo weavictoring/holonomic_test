@@ -11,10 +11,12 @@ This script:
        - Translation: from the left joystick (x,y plane)
        - Rotation: from the right joystick (rotation about z)
      A caster offset is factored in for each wheel.
-  6) For turning, the motor is operated in position mode so that the target turning angle is sent directly.
+  6) For turning, the motor is operated in position mode so the target turning angle is sent directly.
   7) Logs live status: for each module the desired (turn) angle, the real-time encoder angle (with offset applied),
      and the rolling command.
   8) Runs the control loop at ~50 Hz.
+  9) Runs a visualization thread that periodically creates a PNG showing the input data and the robot's movement,
+     including its outline and direction vectors.
  
 Test carefully at low current & speed with the robot wheels off the ground!
 """
@@ -245,7 +247,6 @@ class SwerveVehicle:
         else:
             self.nominal_wheel_positions = [np.array(pos) for pos in nominal_wheel_positions]
 
-        # --------------------------------------------------------------------
         # Precompute effective nominal wheel positions (matrix version)
         # This adds the caster offset along the direction of each nominal wheel position.
         P = np.stack(self.nominal_wheel_positions)  # shape (n,2)
@@ -256,7 +257,8 @@ class SwerveVehicle:
                 self.effective_nominal[i, :] = P[i, :] + (P[i, :] / norms[i]) * self.caster_offset
             else:
                 self.effective_nominal[i, :] = P[i, :]
-        # --------------------------------------------------------------------
+        # Initialize a simple robot odometry (for visualization) at (0,0)
+        self.robot_position = np.array([0.0, 0.0])
     
     def start(self):
         self.ctrl_thread.start()
@@ -285,7 +287,6 @@ class SwerveVehicle:
         num = self.num_wheels
         v_trans = np.array([vx, vy])
         v_trans_tile = np.tile(v_trans, (num, 1))
-        # Use the precomputed effective_nominal positions
         v_rot = omega * np.column_stack((-self.effective_nominal[:, 1], self.effective_nominal[:, 0]))
         v_total = v_trans_tile + v_rot
         return v_total
@@ -298,6 +299,7 @@ class SwerveVehicle:
           - desired turning angles (mapped to [0, 1) turns)
           - rolling speeds (as norms of the wheel velocity vectors)
         For turning, the desired turning angles are sent directly using position mode.
+        Also integrates the robot’s translational motion for visualization.
         """
         last_t = time.time()
         num = self.num_wheels
@@ -307,18 +309,18 @@ class SwerveVehicle:
             dt = now - last_t
             if dt < CONTROL_PERIOD:
                 time.sleep(CONTROL_PERIOD - dt)
+                now = time.time()
+                dt = now - last_t
             last_t = now
             
             vx, vy, omega = self.target_velocity
-            logging.debug(f"Target velocity: vx={vx:.3f}, vy={vy:.3f}, ω={omega:.3f}")
+            # Integrate robot position (assume heading = 0 for simplicity)
+            self.robot_position += np.array([vx, vy]) * dt
             
-            # Compute total wheel velocity vector using the helper function.
+            # Compute total wheel velocity vectors.
             v_total = self.compute_wheel_velocities(vx, vy, omega)
-            # Rolling speed: the norm of each wheel's velocity vector.
             roll_speed = np.linalg.norm(v_total, axis=1)
-            # Desired turning angle (in radians) for each wheel using arctan2.
             desired_angle = np.arctan2(v_total[:, 1], v_total[:, 0])
-            # Map to turns in [0, 1)
             desired_angle_turns = (desired_angle / (2 * math.pi)) % 1.0
             
             # Directly send the desired turning angles and rolling speeds.
@@ -346,6 +348,70 @@ class SwerveVehicle:
                              f"Turn FB (with offset) = {turn_fb_with_offset:.3f} turns, "
                              f"Roll FB = {roll_fb:.3f} turns")
 
+# ------------------ VISUALIZATION THREAD ------------------
+def visualization_loop(vehicle):
+    """
+    Uses matplotlib to produce a visualization of:
+      - The robot's current estimated position (integrated)
+      - The robot's outline (based on nominal wheel positions)
+      - The target translational velocity vector (drawn as an arrow)
+      - Each module's effective wheel position and its directional (turning) vector
+    This image is saved periodically to 'robot_state.png'.
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # Headless backend
+    import matplotlib.pyplot as plt
+
+    last_time = time.time()
+    while vehicle.run_flag:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        # Start plotting.
+        fig, ax = plt.subplots(figsize=(6,6))
+        ax.set_title("Robot State and Command Vectors")
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_aspect('equal')
+        
+        # Draw robot outline based on nominal positions (shifted by robot_position)
+        nominal = np.stack(vehicle.nominal_wheel_positions)
+        nominal_shifted = nominal + vehicle.robot_position
+        polygon = np.vstack((nominal_shifted, nominal_shifted[0]))  # close the loop
+        ax.plot(polygon[:,0], polygon[:,1], 'k-', linewidth=2, label="Robot Outline")
+        
+        # Mark robot center.
+        ax.plot(vehicle.robot_position[0], vehicle.robot_position[1], 'ro', label="Robot Center")
+        
+        # Draw target translational velocity vector (scaled for visualization).
+        vx, vy, _ = vehicle.target_velocity
+        scale = 0.2  # adjust scale factor as needed
+        ax.arrow(vehicle.robot_position[0], vehicle.robot_position[1],
+                 vx*scale, vy*scale, head_width=0.02, head_length=0.03,
+                 fc='g', ec='g', label="Translational cmd")
+        
+        # Draw each module's effective wheel position and its directional arrow.
+        for i, mod in enumerate(vehicle.modules):
+            # Effective wheel position (from precomputed matrix, shifted by robot position)
+            pos = vehicle.effective_nominal[i] + vehicle.robot_position
+            # Get desired turning angle from last command and convert turns to radians.
+            desired_turn_angle_turns, roll_speed = mod.last_command
+            desired_turn_angle_rad = desired_turn_angle_turns * 2*math.pi
+            # Scale arrow length by roll speed.
+            arrow_length = roll_speed * 0.2
+            dx = math.cos(desired_turn_angle_rad) * arrow_length
+            dy = math.sin(desired_turn_angle_rad) * arrow_length
+            ax.plot(pos[0], pos[1], 'bo')  # wheel marker
+            ax.arrow(pos[0], pos[1], dx, dy, head_width=0.01, head_length=0.015,
+                     fc='b', ec='b')
+            ax.text(pos[0], pos[1], f"{i}", color="b")
+        
+        ax.legend(loc="upper left")
+        plt.savefig("robot_state.png")
+        plt.close(fig)
+        time.sleep(1.0)
+
 # ------------------ JOYSTICK INPUT THREAD ------------------
 def joystick_input_thread(vehicle, joystick):
     """
@@ -360,7 +426,6 @@ def joystick_input_thread(vehicle, joystick):
     
     Translation [vx, vy] is scaled by MAX_LINEAR_VEL and rotation by MAX_ANG_VEL.
     """
-    # Retrieve left stick properties for translation.
     try:
         absinfo_left_x = joystick.absinfo(ecodes.ABS_X)
         absinfo_left_y = joystick.absinfo(ecodes.ABS_Y)
@@ -375,7 +440,6 @@ def joystick_input_thread(vehicle, joystick):
         center_left_x = center_left_y = 0.0
         range_left_x = range_left_y = 1.0
 
-    # Retrieve right stick property for rotation.
     try:
         absinfo_rx = joystick.absinfo(ecodes.ABS_RX)
         center_rx = (absinfo_rx.min + absinfo_rx.max) / 2
@@ -403,10 +467,8 @@ def joystick_input_thread(vehicle, joystick):
                 if abs(right_x) < JOYSTICK_DEADZONE:
                     right_x = 0.0
             
-            # Compute translational commands from left stick.
             vx = left_y * MAX_LINEAR_VEL
             vy = left_x * MAX_LINEAR_VEL
-            # Compute rotational command from right stick.
             omega = right_x * MAX_ANG_VEL
             
             vehicle.set_target_velocity([vx, vy, omega])
@@ -495,6 +557,10 @@ def main():
     
     vehicle = SwerveVehicle(bus, fb_collector, modules, robot_size, num_wheels, caster_offset, nominal_wheel_positions)
     vehicle.start()
+    
+    # Start visualization in a separate thread.
+    vis_thread = threading.Thread(target=visualization_loop, args=(vehicle,), daemon=True)
+    vis_thread.start()
     
     js_thread = threading.Thread(target=joystick_input_thread, args=(vehicle, joystick), daemon=True)
     js_thread.start()
